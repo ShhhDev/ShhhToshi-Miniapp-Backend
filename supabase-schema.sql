@@ -26,11 +26,13 @@ CREATE TABLE IF NOT EXISTS users (
   last_active BIGINT DEFAULT 0,
   wallet TEXT DEFAULT '',
   og_pass INT DEFAULT 0,
+  og_pass_expires_at BIGINT DEFAULT 0,
   friend_earnings REAL DEFAULT 0,
   tap_extra INT DEFAULT 0,
   claimed_milestones TEXT DEFAULT '{}',
   photo_url TEXT DEFAULT '',
   ref_code TEXT DEFAULT '',
+  banned INT DEFAULT 0,
   created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
   updated_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
 );
@@ -78,7 +80,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   img TEXT DEFAULT '',
   link TEXT DEFAULT '',
   sort_order INT DEFAULT 0,
-  active INT DEFAULT 1
+  active INT DEFAULT 1,
+  type TEXT DEFAULT 'social',
+  chat_id TEXT DEFAULT '',
+  block_id TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS cards (
@@ -91,7 +96,10 @@ CREATE TABLE IF NOT EXISTS cards (
   lock_text TEXT DEFAULT '',
   img TEXT DEFAULT '',
   sort_order INT DEFAULT 0,
-  active INT DEFAULT 1
+  active INT DEFAULT 1,
+  stars_price INT DEFAULT 0,
+  gram_price REAL DEFAULT 0,
+  max_level INT DEFAULT 8
 );
 
 CREATE TABLE IF NOT EXISTS boosters (
@@ -104,6 +112,17 @@ CREATE TABLE IF NOT EXISTS boosters (
   base_cost INT DEFAULT 0,
   effect_type TEXT DEFAULT '',
   effect_value INT DEFAULT 1,
+  sort_order INT DEFAULT 0,
+  active INT DEFAULT 1,
+  stars_price INT DEFAULT 0,
+  gram_price REAL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS spin_packs (
+  id TEXT PRIMARY KEY,
+  spins INT NOT NULL,
+  stars_price INT DEFAULT 0,
+  gram_price REAL DEFAULT 0,
   sort_order INT DEFAULT 0,
   active INT DEFAULT 1
 );
@@ -147,3 +166,30 @@ CREATE TABLE IF NOT EXISTS withdrawals (
 CREATE INDEX IF NOT EXISTS idx_withdrawals_user ON withdrawals(telegram_id);
 CREATE INDEX IF NOT EXISTS idx_withdrawals_status ON withdrawals(status);
 CREATE INDEX IF NOT EXISTS idx_users_balance ON users(balance DESC);
+
+CREATE TABLE IF NOT EXISTS stars_invoices (
+  payload TEXT PRIMARY KEY,
+  telegram_id BIGINT NOT NULL,
+  kind TEXT NOT NULL,
+  item_id TEXT DEFAULT '',
+  stars_amount INT NOT NULL,
+  status TEXT DEFAULT 'pending',
+  telegram_payment_charge_id TEXT DEFAULT '',
+  created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+  updated_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS ton_payments (
+  memo TEXT PRIMARY KEY,
+  telegram_id BIGINT NOT NULL,
+  kind TEXT NOT NULL,
+  item_id TEXT DEFAULT '',
+  ton_amount REAL NOT NULL,
+  status TEXT DEFAULT 'pending',
+  tx_hash TEXT DEFAULT '',
+  created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+  updated_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+);
+
+CREATE INDEX IF NOT EXISTS idx_stars_invoices_user ON stars_invoices(telegram_id);
+CREATE INDEX IF NOT EXISTS idx_ton_payments_user ON ton_payments(telegram_id);
