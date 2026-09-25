@@ -441,6 +441,8 @@ function userToClient(row) {
     energy: Math.floor(row.energy || 0),
     maxEnergy: row.max_energy,
     streakDay: row.streak_day,
+    lastClaimDaily: row.last_claim_daily || 0,
+    lastClaimAt: row.last_claim_daily || 0,
     spins: row.spins,
     miningTimerHrs: row.mining_timer_hrs,
     charEmoji: row.char_emoji,
@@ -527,12 +529,13 @@ app.post('/api/auth', authMiddleware, async (req, res) => {
       id: p.telegram_id,
       telegram_id: p.telegram_id,
       name: (p.first_name || p.handle || p.username || 'Player').toString().replace(/^@/, ''),
-      score: Math.floor(p.total || p.balance || 0),
-      total: Math.floor(p.total || p.balance || 0),
-      balance: Math.floor(p.total || p.balance || 0),
-      hourly: p.hourly || 0,
-      friends: p.friends || 0,
-      isYou: p.telegram_id === row.telegram_id
+      score: Math.floor(Number(p.total != null ? p.total : p.balance) || 0),
+      total: Math.floor(Number(p.total != null ? p.total : p.balance) || 0),
+      balance: Math.floor(Number(p.total != null ? p.total : p.balance) || 0),
+      hourly: Number(p.hourly) || 0,
+      friends: Number(p.friends) || 0,
+      rank: i + 1,
+      isYou: Number(p.telegram_id) === Number(row.telegram_id)
     }))
   });
 });
@@ -662,7 +665,21 @@ app.post('/api/tasks/complete', authMiddleware, async (req, res) => {
   await dbx.run('UPDATE users SET balance = balance + ?, updated_at = ? WHERE telegram_id = ?', [task.reward, Math.floor(Date.now() / 1000), user.id]);
 
   const updated = await dbx.get('SELECT balance FROM users WHERE telegram_id = ?', [user.id]);
-  res.json({ reward: task.reward, balance: Math.floor(updated.balance) });
+  res.json({ reward: task.reward, balance: Math.floor(updated.balance), user: userToClient(await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [user.id])) });
+});
+
+// Alias singular path used by frontend
+app.post('/api/task/complete', authMiddleware, async (req, res) => {
+  const { user } = req.tg;
+  const taskId = req.body.taskId;
+  const task = await dbx.get('SELECT * FROM tasks WHERE id = ? AND active = 1', [taskId]);
+  if (!task) return res.status(400).json({ error: 'Task not found' });
+  const already = await dbx.get('SELECT 1 FROM user_tasks WHERE telegram_id = ? AND task_id = ? AND done = 1', [user.id, taskId]);
+  if (already) return res.status(400).json({ error: 'Already completed' });
+  await dbx.run(`INSERT INTO user_tasks (telegram_id, task_id, done) VALUES (?, ?, 1) ON CONFLICT(telegram_id, task_id) DO UPDATE SET done = 1`, [user.id, taskId]);
+  await dbx.run('UPDATE users SET balance = balance + ?, updated_at = ? WHERE telegram_id = ?', [task.reward, Math.floor(Date.now() / 1000), user.id]);
+  const full = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [user.id]);
+  res.json({ reward: task.reward, balance: Math.floor(full.balance), user: userToClient(full) });
 });
 
 // Spin
@@ -670,7 +687,7 @@ app.post('/api/spin', authMiddleware, async (req, res) => {
   const { user } = req.tg;
   const row = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [user.id]);
   if (!row) return res.status(404).json({ error: 'User not found' });
-  if (row.spins <= 0) return res.status(400).json({ error: 'No spins left' });
+  if ((Number(row.spins) || 0) <= 0) return res.status(400).json({ error: 'No spins left', spins: 0 });
 
   const prizes = [500, 1000, 2500, 5000, 10000, 25000];
   const win = prizes[Math.floor(Math.random() * prizes.length)];
@@ -1081,13 +1098,22 @@ const DEFAULT_SPIN_PACKAGES = [
 async function getSpinPackages() {
   try {
     const raw = await getSetting('spin_packages', '[]');
-    let arr = JSON.parse(raw || '[]');
+    let arr = [];
+    try { arr = JSON.parse(raw || '[]'); } catch(_) { arr = []; }
     if (!Array.isArray(arr) || arr.length === 0) {
       arr = DEFAULT_SPIN_PACKAGES.slice();
-      await setSetting('spin_packages', JSON.stringify(arr));
+      try { await setSetting('spin_packages', JSON.stringify(arr)); } catch(_) {}
     }
-    return arr;
-  } catch (_) { return DEFAULT_SPIN_PACKAGES.slice(); }
+    // normalize stars field for frontend
+    return arr.map(p => ({
+      ...p,
+      stars: Number(p.stars != null ? p.stars : p.price_stars) || 0,
+      price_stars: Number(p.price_stars != null ? p.price_stars : p.stars) || 0,
+      gram: Number(p.gram != null ? p.gram : p.price_gram) || 0
+    }));
+  } catch (_) {
+    return DEFAULT_SPIN_PACKAGES.map(p => ({ ...p, stars: p.price_stars, gram: p.price_gram }));
+  }
 }
 async function saveSpinPackages(arr) {
   await setSetting('spin_packages', JSON.stringify(arr));
