@@ -328,10 +328,17 @@ function validateInitData(initData) {
 }
 
 // ---------- Middleware ----------
+app.set('trust proxy', 1);
 app.use(cors({ origin: true }));
 app.use(express.json({ limit: '200kb' }));
 
-const limiter = rateLimit({ windowMs: 60 * 1000, max: 150, standardHeaders: true, legacyHeaders: false });
+const limiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 150,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false }
+});
 app.use(limiter);
 
 function authMiddleware(req, res, next) {
@@ -451,7 +458,8 @@ app.post('/api/auth', authMiddleware, async (req, res) => {
 
   const ownedCards = await dbx.all('SELECT card_id, level FROM user_cards WHERE telegram_id = ?', [row.telegram_id]);
   const ownedBoosters = await dbx.all('SELECT booster_id, level FROM user_boosters WHERE telegram_id = ?', [row.telegram_id]);
-  const doneTasks = await dbx.all('SELECT task_id FROM user_tasks WHERE telegram_id = ? AND done = 1', [row.telegram_id]).map(t => t.task_id);
+  const doneTasksRows = await dbx.all('SELECT task_id FROM user_tasks WHERE telegram_id = ? AND done = 1', [row.telegram_id]);
+  const doneTasks = (doneTasksRows || []).map(t => t.task_id);
 
   const friends = await dbx.all(`
     SELECT f.friend_id, u.handle, u.username, u.first_name, f.premium, f.joined_at
