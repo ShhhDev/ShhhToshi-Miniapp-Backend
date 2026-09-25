@@ -277,6 +277,7 @@ async function loadGameConfig() {
     ogPassStarsPrice: Number(await getSetting('og_pass_stars_price', '100')) || 100,
     ogPassGramPrice: Number(await getSetting('og_pass_gram_price', '5')) || 5,
     spinPrice: Number(await getSetting('spin_price', '1')) || 1,
+    spinPacks: await getSpinPackages(),
   };
 }
 
@@ -329,6 +330,7 @@ function validateInitData(initData) {
 
 // ---------- Middleware ----------
 app.set('trust proxy', 1);
+app.options('*', cors({ origin: true }));
 app.use(cors({ origin: true }));
 app.use(express.json({ limit: '200kb' }));
 
@@ -569,7 +571,7 @@ app.post('/api/daily/claim', authMiddleware, async (req, res) => {
   }
 
   const config = await loadGameConfig();
-  const dayIndex = Math.min(row.streak_day - 1, config.dailyRewards.length - 1);
+  const dayIndex = Math.min(Math.max(0, (row.streak_day || 1) - 1), (config.dailyRewards || [1000]).length - 1);
   const amount = config.dailyRewards[dayIndex] || config.dailyRewards[0] || 1000;
 
   await dbx.run(`
@@ -1068,12 +1070,24 @@ app.post('/api/admin/user/:id/unban', authMiddleware, adminMiddleware, async (re
   res.json({ ok: true });
 });
 
+const DEFAULT_SPIN_PACKAGES = [
+  { id: 'sp15', name: '15 Spins', spins: 15, price_sp: 0, price_stars: 50, price_gram: 0 },
+  { id: 'sp100', name: '100 Spins', spins: 100, price_sp: 0, price_stars: 250, price_gram: 0 },
+  { id: 'sp330', name: '330 Spins', spins: 330, price_sp: 0, price_stars: 800, price_gram: 0 },
+  { id: 'sp1000', name: '1000 Spins', spins: 1000, price_sp: 0, price_stars: 2250, price_gram: 0 },
+  { id: 'sp5000', name: '5000 Spins', spins: 5000, price_sp: 0, price_stars: 10000, price_gram: 0 },
+  { id: 'sp15000', name: '15000 Spins', spins: 15000, price_sp: 0, price_stars: 25000, price_gram: 0 }
+];
 async function getSpinPackages() {
   try {
     const raw = await getSetting('spin_packages', '[]');
-    const arr = JSON.parse(raw || '[]');
-    return Array.isArray(arr) ? arr : [];
-  } catch (_) { return []; }
+    let arr = JSON.parse(raw || '[]');
+    if (!Array.isArray(arr) || arr.length === 0) {
+      arr = DEFAULT_SPIN_PACKAGES.slice();
+      await setSetting('spin_packages', JSON.stringify(arr));
+    }
+    return arr;
+  } catch (_) { return DEFAULT_SPIN_PACKAGES.slice(); }
 }
 async function saveSpinPackages(arr) {
   await setSetting('spin_packages', JSON.stringify(arr));
@@ -1131,7 +1145,142 @@ app.get('/api/leaderboard', authMiddleware, async (req, res) => {
   try {
     await ensureDb();
     await seedIfEmpty();
-    app.get('/api/health', async (req, res) => {
+    
+// ---------- Aliases frontend expects ----------
+app.post('/api/user/checkin', authMiddleware, async (req, res) => {
+  try {
+    const { user } = req.tg;
+    const row = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [user.id]);
+    if (!row) return res.status(404).json({ error: 'User not found' });
+
+    const now = Math.floor(Date.now() / 1000);
+    if (now - (row.last_claim_daily || 0) < 20 * 3600) {
+      return res.status(400).json({ error: 'Already claimed today', check_in: { streak: row.streak_day || 0, lastDay: 'today' } });
+    }
+
+    const config = await loadGameConfig();
+    const rewards = config.dailyRewards || [2500, 5000, 7500, 10000, 15000, 20000, 30000];
+    const streak = Math.max(0, Number(row.streak_day) || 0);
+    const dayIndex = Math.min(streak, rewards.length - 1);
+    const amount = rewards[dayIndex] || rewards[0] || 2500;
+
+    await dbx.run(`
+      UPDATE users SET balance = balance + ?, streak_day = ?,
+        last_claim_daily = ?, last_active = ?, updated_at = ?
+      WHERE telegram_id = ?
+    `, [amount, streak + 1, now, now, now, user.id]);
+
+    const updated = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [user.id]);
+    res.json({
+      ok: true,
+      reward_given: amount,
+      reward: amount,
+      amount,
+      balance: Math.floor(updated.balance),
+      streakDay: updated.streak_day,
+      check_in: { streak: updated.streak_day, lastDay: new Date().toISOString().slice(0, 10), claimedDays: [] },
+      user: userToClient(updated)
+    });
+  } catch (e) {
+    console.error('checkin', e);
+    res.status(500).json({ error: e.message || 'checkin failed' });
+  }
+});
+
+app.post('/api/stars/invoice', authMiddleware, async (req, res) => {
+  try {
+    const kind = String(req.body.kind || 'spinpack');
+    const stars = Number(req.body.stars) || 0;
+    const title = kind === 'ogpass' ? 'OG Pass' : kind === 'spinpack' ? 'Spin Pack' : 'Purchase';
+    const description = title + ' — ShhhToshi';
+    const payload = JSON.stringify({
+      kind,
+      packId: req.body.packId || null,
+      spins: req.body.spins || null,
+      cardId: req.body.cardId || null,
+      boost_id: req.body.boost_id || null,
+      uid: req.tg.user.id
+    });
+
+    // Telegram Stars invoice via Bot API (currency XTR)
+    if (BOT_TOKEN && stars > 0) {
+      try {
+        const body = {
+          title: title.slice(0, 32),
+          description: description.slice(0, 255),
+          payload: payload.slice(0, 128),
+          currency: 'XTR',
+          prices: [{ label: title.slice(0, 32), amount: Math.max(1, Math.floor(stars)) }]
+        };
+        const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/createInvoiceLink`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const data = await r.json();
+        if (data.ok && data.result) {
+          return res.json({ invoiceLink: data.result, stars });
+        }
+        console.error('createInvoiceLink', data);
+      } catch (e) {
+        console.error('invoice fetch', e);
+      }
+    }
+    // Soft fail so frontend can fall back to SHHHT purchase / grant
+    res.json({ invoiceLink: null, skip: true, stars, message: 'Stars invoice unavailable — try again or use balance' });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'invoice failed' });
+  }
+});
+
+app.post('/api/shop/spin-pack', authMiddleware, async (req, res) => {
+  try {
+    const { user } = req.tg;
+    const packId = String(req.body.packId || '');
+    const packs = await getSpinPackages();
+    const pack = packs.find(p => p.id === packId) || {
+      id: packId,
+      spins: Number(req.body.spins) || 0,
+      price_sp: 0,
+      price_stars: Number(req.body.stars) || 0
+    };
+    const spins = Math.max(0, Number(pack.spins) || Number(req.body.spins) || 0);
+    if (spins <= 0) return res.status(400).json({ error: 'Invalid pack' });
+
+    const row = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [user.id]);
+    if (!row) return res.status(404).json({ error: 'User not found' });
+
+    const costSp = Number(pack.price_sp) || 0;
+    if (costSp > 0 && (row.balance || 0) < costSp) {
+      return res.status(400).json({ error: 'Not enough balance' });
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    if (costSp > 0) {
+      await dbx.run('UPDATE users SET balance = balance - ?, spins = spins + ?, updated_at = ? WHERE telegram_id = ?',
+        [costSp, spins, now, user.id]);
+    } else {
+      // Stars / free grant after invoice flow
+      await dbx.run('UPDATE users SET spins = spins + ?, updated_at = ? WHERE telegram_id = ?',
+        [spins, now, user.id]);
+    }
+    const updated = await dbx.get('SELECT balance, spins FROM users WHERE telegram_id = ?', [user.id]);
+    res.json({ ok: true, spins: updated.spins, balance: Math.floor(updated.balance) });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'spin pack failed' });
+  }
+});
+
+app.post('/api/user/wallet', authMiddleware, async (req, res) => {
+  const addr = String(req.body.wallet_address || req.body.wallet || '').trim();
+  if (!addr) return res.status(400).json({ error: 'wallet required' });
+  await dbx.run('UPDATE users SET wallet = ?, updated_at = ? WHERE telegram_id = ?',
+    [addr, Math.floor(Date.now() / 1000), req.tg.user.id]);
+  res.json({ ok: true, wallet: addr });
+});
+
+
+app.get('/api/health', async (req, res) => {
       res.json({ ok: true, ts: Date.now(), db: dbx.isPg() ? 'postgres' : 'sqlite' });
     });
     app.listen(PORT, '0.0.0.0', () => {
