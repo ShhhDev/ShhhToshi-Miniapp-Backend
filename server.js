@@ -403,6 +403,26 @@ async function getOrCreateUser(tgUser, startParam = null) {
   return row;
 }
 
+
+const LEVEL_TABLE = [
+  { name: "Rookie",   min: 0,        baseTap: 1, energy: 1000 },
+  { name: "Bronze",   min: 10000,    baseTap: 2, energy: 1500 },
+  { name: "Silver",   min: 50000,    baseTap: 3, energy: 2000 },
+  { name: "Gold",     min: 150000,   baseTap: 4, energy: 2500 },
+  { name: "Platinum", min: 400000,   baseTap: 5, energy: 3000 },
+  { name: "Diamond",  min: 1000000,  baseTap: 6, energy: 3500 },
+  { name: "Master",   min: 2500000,  baseTap: 7, energy: 4000 },
+  { name: "Legend",   min: 5000000,  baseTap: 8, energy: 5000 }
+];
+function levelFromBalance(bal) {
+  const n = Number(bal) || 0;
+  let lv = LEVEL_TABLE[0];
+  for (const row of LEVEL_TABLE) {
+    if (n >= row.min) lv = row;
+  }
+  return lv;
+}
+
 function userToClient(row) {
   return {
     telegramId: row.telegram_id,
@@ -522,8 +542,10 @@ app.post('/api/tap', authMiddleware, async (req, res) => {
   const row = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [user.id]);
   if (!row) return res.status(404).json({ error: 'User not found' });
 
+  const lv = levelFromBalance(row.balance);
+  const perTap = Math.max(Number(row.per_tap) || 1, lv.baseTap);
   const energyCost = taps;
-  const gain = (row.per_tap || 1) * taps;
+  const gain = perTap * taps;
   if ((row.energy || 0) < energyCost) return res.status(400).json({ error: 'Not enough energy', energy: row.energy });
 
   await dbx.run(`
@@ -532,7 +554,7 @@ app.post('/api/tap', authMiddleware, async (req, res) => {
   `, [energyCost, gain, Math.floor(Date.now() / 1000), Math.floor(Date.now() / 1000), user.id]);
 
   const updated = await dbx.get('SELECT balance, energy FROM users WHERE telegram_id = ?', [user.id]);
-  res.json({ balance: Math.floor(updated.balance), energy: Math.floor(updated.energy), earned: cost });
+  res.json({ balance: Math.floor(updated.balance), energy: Math.floor(updated.energy), earned: gain });
 });
 
 // Daily claim
@@ -1023,7 +1045,12 @@ app.post('/api/admin/user/:id/balance', authMiddleware, adminMiddleware, async (
   const bal = Number(req.body.balance != null ? req.body.balance : req.body.shhhtoshi);
   if (Number.isNaN(bal)) return res.status(400).json({ error: 'Invalid balance' });
   const now = Math.floor(Date.now() / 1000);
-  await dbx.run('UPDATE users SET balance = ?, updated_at = ? WHERE telegram_id = ?', [bal, now, id]);
+  const lv = levelFromBalance(bal);
+  const extraTap = 0;
+  await dbx.run(
+    'UPDATE users SET balance = ?, per_tap = ?, max_energy = ?, energy = ?, updated_at = ? WHERE telegram_id = ?',
+    [bal, lv.baseTap + extraTap, lv.energy, lv.energy, now, id]
+  );
   const row = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [id]);
   res.json({ ok: true, user: row ? userToClient(row) : null });
 });
