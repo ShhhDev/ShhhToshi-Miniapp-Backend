@@ -10,6 +10,8 @@ Admin (bot-side):
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -28,13 +30,13 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    PreCheckoutQueryHandler,
     ConversationHandler,
     ContextTypes,
-    PreCheckoutQueryHandler,
     filters,
 )
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from telegram.error import TelegramError, RetryAfter
 import httpx
 
 # Load backend root .env (API + bot hosted together), then local bot/.env
@@ -49,19 +51,13 @@ ADMIN_IDS = {
     for x in (os.getenv("ADMIN_TELEGRAM_IDS") or "").split(",")
     if x.strip().isdigit()
 }
-INTERNAL_API_SECRET = os.getenv("INTERNAL_API_SECRET") or ""
-# The Node API and this bot run in the same container (see start.sh), so localhost + PORT reaches it.
-INTERNAL_API_BASE = os.getenv("INTERNAL_API_BASE") or f"http://127.0.0.1:{os.getenv('PORT', '8080')}"
 
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN is required in .env")
 if not WEBAPP_URL:
     raise SystemExit("WEBAPP_URL is required in .env (HTTPS URL of your Mini App)")
-if not INTERNAL_API_SECRET:
-    logging.warning(
-        "INTERNAL_API_SECRET is not set — Telegram Stars purchases will not be fulfilled "
-        "(pre_checkout will still be accepted, but the item won't be granted)."
-    )
+API_URL = f"http://127.0.0.1:{os.getenv('PORT', '8080')}"
+INTERNAL_SECRET = hashlib.sha256(f"internal:{BOT_TOKEN}".encode()).hexdigest()
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
@@ -268,6 +264,7 @@ async def send_welcome_message(bot, chat_id: int, cfg: dict | None = None) -> No
             chat_id=chat_id,
             text=payload["text"],
             reply_markup=keyboard,
+            parse_mode=None,
         )
 
 
@@ -339,6 +336,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not user:
         return
     track_user(user.id)
+    arg = (context.args[0] if context.args else "") or ""
+    if arg.startswith("ref_") and arg[4:].isdigit() and int(arg[4:]) != user.id:
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                await c.post(
+                    f"{API_URL}/api/internal/referral",
+                    headers={"x-internal-secret": INTERNAL_SECRET},
+                    json={
+                        "inviter_id": int(arg[4:]),
+                        "user": {
+                            "id": user.id,
+                            "first_name": user.first_name,
+                            "username": user.username,
+                            "language_code": user.language_code,
+                            "is_premium": bool(user.is_premium),
+                        },
+                    },
+                )
+        except Exception as e:
+            logger.error("referral register failed: %s", e)
     try:
         await context.bot.set_chat_menu_button(
             chat_id=update.effective_chat.id,
@@ -696,8 +713,13 @@ async def send_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ok, fail = 0, 0
     for uid in users:
         try:
-            await send_payload(context.bot, uid, draft["payload"], reply_markup=kb)
+            try:
+                await send_payload(context.bot, uid, draft["payload"], reply_markup=kb)
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+                await send_payload(context.bot, uid, draft["payload"], reply_markup=kb)
             ok += 1
+            await asyncio.sleep(0.05)  # stay under Telegram's ~30 msg/s limit
         except Exception as e:
             logger.debug("broadcast fail %s: %s", uid, e)
             fail += 1
@@ -708,59 +730,30 @@ async def send_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.pre_checkout_query.answer(ok=True)
+
+
+async def paid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    pay = update.message.successful_payment
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(
+                f"{API_URL}/api/internal/payment",
+                headers={"x-internal-secret": INTERNAL_SECRET},
+                json={"charge_id": pay.telegram_payment_charge_id, "payload": pay.invoice_payload},
+            )
+            r.raise_for_status()
+        await update.message.reply_text("Payment received — your purchase is active. Reopen the Mini App.")
+    except Exception as e:
+        logger.error("payment grant failed %s: %s", pay.telegram_payment_charge_id, e)
+        await update.message.reply_text("Payment received but delivery failed. Contact support with: " + pay.telegram_payment_charge_id)
+
+
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     clear_draft()
     await update.message.reply_text("Cancelled. Draft cleared.")
     return ConversationHandler.END
-
-
-# ---------- Telegram Stars payments ----------
-async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Telegram requires an answer within 10 seconds or the payment is cancelled client-side."""
-    query = update.pre_checkout_query
-    try:
-        await query.answer(ok=True)
-    except TelegramError as e:
-        logger.error("pre_checkout answer failed: %s", e)
-
-
-async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Forward the confirmed payment to the Node API so it can grant the purchased item.
-    This is the source of truth for fulfillment — the frontend never grants items itself."""
-    sp = update.message.successful_payment
-    payload = sp.invoice_payload
-    charge_id = sp.telegram_payment_charge_id
-    logger.info("successful_payment payload=%s charge_id=%s", payload, charge_id)
-
-    if not INTERNAL_API_SECRET:
-        logger.error("Cannot fulfill Stars payment: INTERNAL_API_SECRET is not set.")
-        await update.message.reply_text(
-            "Payment received, but the app couldn't credit it automatically. "
-            "Please contact support with this reference: " + charge_id
-        )
-        return
-
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(
-                f"{INTERNAL_API_BASE}/internal/stars/fulfilled",
-                headers={"x-internal-secret": INTERNAL_API_SECRET},
-                json={"payload": payload, "telegramPaymentChargeId": charge_id},
-            )
-        if r.status_code == 200:
-            await update.message.reply_text("✅ Payment confirmed! Your purchase has been credited.")
-        else:
-            logger.error("Fulfillment call failed: %s %s", r.status_code, r.text)
-            await update.message.reply_text(
-                "Payment received, but crediting it failed. "
-                "Please contact support with this reference: " + charge_id
-            )
-    except Exception as e:
-        logger.error("Fulfillment call error: %s", e)
-        await update.message.reply_text(
-            "Payment received, but crediting it failed. "
-            "Please contact support with this reference: " + charge_id
-        )
 
 
 def main() -> None:
@@ -779,9 +772,9 @@ def main() -> None:
     app.add_handler(CommandHandler("listbuttons", listbuttons_cmd))
     app.add_handler(CommandHandler("clearbuttons", clearbuttons_cmd))
     app.add_handler(CommandHandler("send", send_cmd))
-
-    app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
+    app.add_handler(PreCheckoutQueryHandler(precheckout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, paid))
 
     app.add_handler(
         ConversationHandler(

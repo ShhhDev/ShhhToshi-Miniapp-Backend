@@ -28,7 +28,9 @@ function adaptSql(sql) {
 
 async function init() {
   if (USE_PG) {
-    const { Pool } = require('pg');
+    const { Pool, types } = require('pg');
+    types.setTypeParser(20, v => Number(v)); // BIGINT -> number (telegram ids, timestamps)
+    types.setTypeParser(1700, v => Number(v));
     pool = new Pool({
       connectionString: DATABASE_URL,
       ssl: process.env.PG_SSL === 'false' ? false : { rejectUnauthorized: false },
@@ -58,34 +60,7 @@ async function migratePg() {
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS claimed_milestones TEXT DEFAULT '{}'",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url TEXT DEFAULT ''",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS ref_code TEXT DEFAULT ''",
-    'ALTER TABLE users ADD COLUMN IF NOT EXISTS banned INT DEFAULT 0',
-    "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS type TEXT DEFAULT 'social'",
-    "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS chat_id TEXT DEFAULT ''",
-    "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS block_id TEXT DEFAULT ''",
-    'ALTER TABLE users ADD COLUMN IF NOT EXISTS og_pass_expires_at BIGINT DEFAULT 0',
-    'ALTER TABLE cards ADD COLUMN IF NOT EXISTS stars_price INT DEFAULT 0',
-    'ALTER TABLE cards ADD COLUMN IF NOT EXISTS gram_price REAL DEFAULT 0',
-    'ALTER TABLE cards ADD COLUMN IF NOT EXISTS max_level INT DEFAULT 8',
-    'ALTER TABLE boosters ADD COLUMN IF NOT EXISTS stars_price INT DEFAULT 0',
-    'ALTER TABLE boosters ADD COLUMN IF NOT EXISTS gram_price REAL DEFAULT 0',
-    `CREATE TABLE IF NOT EXISTS spin_packs (
-      id TEXT PRIMARY KEY, spins INT NOT NULL, stars_price INT DEFAULT 0,
-      gram_price REAL DEFAULT 0, sort_order INT DEFAULT 0, active INT DEFAULT 1
-    )`,
-    `CREATE TABLE IF NOT EXISTS stars_invoices (
-      payload TEXT PRIMARY KEY, telegram_id BIGINT NOT NULL, kind TEXT NOT NULL,
-      item_id TEXT DEFAULT '', stars_amount INT NOT NULL, status TEXT DEFAULT 'pending',
-      telegram_payment_charge_id TEXT DEFAULT '',
-      created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-      updated_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
-    )`,
-    `CREATE TABLE IF NOT EXISTS ton_payments (
-      memo TEXT PRIMARY KEY, telegram_id BIGINT NOT NULL, kind TEXT NOT NULL,
-      item_id TEXT DEFAULT '', ton_amount REAL NOT NULL, status TEXT DEFAULT 'pending',
-      tx_hash TEXT DEFAULT '',
-      created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-      updated_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
-    )`,
+    'ALTER TABLE users ADD COLUMN IF NOT EXISTS last_reminder_at BIGINT DEFAULT 0',
   ];
   for (const sql of alters) {
     try { await pool.query(sql); } catch (e) { /* ignore */ }

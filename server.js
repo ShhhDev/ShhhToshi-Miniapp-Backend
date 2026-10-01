@@ -15,6 +15,9 @@ const path = require('path');
 const dbx = require('./db');
 
 const app = express();
+// Express 4 doesn't catch async errors -> wrap handlers so a DB error returns 500 instead of hanging/crashing
+['get','post','put','delete'].forEach(m=>{const o=app[m].bind(app);app[m]=(p,...h)=>o(p,...h.map(f=>typeof f==='function'&&f.length<4?(q,r,n)=>Promise.resolve(f(q,r,n)).catch(e=>{console.error(m,p,e);if(!r.headersSent)r.status(500).json({error:'Server error'});}):f));});
+process.on('unhandledRejection',e=>console.error('unhandledRejection',e));
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_TELEGRAM_IDS = (process.env.ADMIN_TELEGRAM_IDS || '')
@@ -100,7 +103,7 @@ async function ensureDb() {
     lock_text TEXT DEFAULT '', img TEXT DEFAULT '', sort_order INTEGER DEFAULT 0, active INTEGER DEFAULT 1
   );
   CREATE TABLE IF NOT EXISTS boosters (
-    id TEXT PRIMARY KEY, name TEXT NOT NULL, desc TEXT DEFAULT '', metric TEXT DEFAULT '',
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, "desc" TEXT DEFAULT '', metric TEXT DEFAULT '',
     icon TEXT DEFAULT '', img TEXT DEFAULT '', base_cost INTEGER DEFAULT 0,
     effect_type TEXT DEFAULT '', effect_value INTEGER DEFAULT 1,
     sort_order INTEGER DEFAULT 0, active INTEGER DEFAULT 1
@@ -124,6 +127,9 @@ async function ensureDb() {
     created_at INTEGER, updated_at INTEGER
   );
 `);
+  }
+  if (!dbx.isPg()) {
+    try { await dbx.exec('ALTER TABLE users ADD COLUMN last_reminder_at INTEGER DEFAULT 0'); } catch (_) { /* already exists */ }
   }
   dbReady = true;
 }
@@ -170,7 +176,7 @@ async function seedIfEmpty() {
     ];
     for (const b of boosters) {
       await dbx.run(
-        'INSERT INTO boosters (id,name,desc,metric,icon,img,base_cost,effect_type,effect_value,sort_order) VALUES (?,?,?,?,?,?,?,?,?,?)',
+        'INSERT INTO boosters (id,name,"desc",metric,icon,img,base_cost,effect_type,effect_value,sort_order) VALUES (?,?,?,?,?,?,?,?,?,?)',
         b
       );
     }
@@ -199,6 +205,8 @@ async function seedIfEmpty() {
     og_pass_stars_price: '100',
     og_pass_gram_price: '5',
     spin_price: '1',
+    referral_reward: '5000',
+    referral_reward_premium: '25000',
   };
   for (const [k, v] of Object.entries(defaults)) {
     const exists = await dbx.get('SELECT key FROM settings WHERE key = ?', [k]);
@@ -278,6 +286,13 @@ async function loadGameConfig() {
     ogPassGramPrice: Number(await getSetting('og_pass_gram_price', '5')) || 5,
     spinPrice: Number(await getSetting('spin_price', '1')) || 1,
     spinPacks: await getSpinPackages(),
+    inviteMessage: await getSetting('invite_message', DEFAULT_INVITE_MSG),
+    inviteButtonText: await getSetting('invite_button_text', 'Join Me'),
+    shopBoosts: boosters.map(b => ({
+      id: b.id, title: b.name, name: b.name, desc: b.desc, description: b.desc, image: b.img || '',
+      kind: b.effect_type === 'multitap' ? 'tap_power' : b.effect_type, boost: b.effect_value,
+      spPrice: b.base_cost, requirement: 'sp', pay_methods: ['sp']
+    })),
   };
 }
 
@@ -363,6 +378,45 @@ function adminMiddleware(req, res, next) {
   next();
 }
 
+
+async function tgSend(chatId, text, replyMarkup) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true, ...(replyMarkup ? { reply_markup: replyMarkup } : {}) })
+      }).then(x => x.json());
+      if (r && r.ok) return true;
+      if (r && r.error_code === 429 && attempt === 0) { await new Promise(z => setTimeout(z, ((r.parameters && r.parameters.retry_after) || 2) * 1000 + 500)); continue; }
+      return false; // e.g. user blocked the bot
+    } catch (e) { console.error('tgSend', e.message); return false; }
+  }
+  return false;
+}
+const escHtml = s => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+/** Count a referral exactly once, pay the inviter, and DM them "New Refer Joined" + total count. */
+async function registerReferral(inviterId, tgUser) {
+  if (!inviterId || inviterId === tgUser.id) return false;
+  const inviter = await dbx.get('SELECT telegram_id, balance FROM users WHERE telegram_id = ?', [inviterId]);
+  if (!inviter) return false;
+  const r = await dbx.run('INSERT OR IGNORE INTO referrals (telegram_id, referred_by) VALUES (?, ?)', [tgUser.id, inviterId]);
+  if (!r.changes) return false; // already referred -> never double count
+  const now = Math.floor(Date.now() / 1000);
+  await dbx.run('INSERT OR IGNORE INTO friends (inviter_id, friend_id, premium, joined_at) VALUES (?, ?, ?, ?)', [inviterId, tgUser.id, tgUser.is_premium ? 1 : 0, now]);
+  const rr = await refRewardsFor(inviter.balance);
+  const reward = tgUser.is_premium ? rr.premium : rr.normal;
+  await dbx.run('UPDATE users SET friend_earnings = friend_earnings + ?, updated_at = ? WHERE telegram_id = ?', [reward, now, inviterId]);
+  const cnt = await dbx.get('SELECT COUNT(*) AS c FROM friends WHERE inviter_id = ?', [inviterId]);
+  const name = escHtml(tgUser.first_name || tgUser.username || 'Someone') + (tgUser.username ? ' (@' + escHtml(tgUser.username) + ')' : '');
+  await tgSend(inviterId,
+    '🎉 <b>New Refer Joined through your link!</b>\n\n' +
+    '👤 ' + name + (tgUser.is_premium ? ' ⭐' : '') + '\n' +
+    '🎁 Reward: <b>+' + reward.toLocaleString('en-US') + '</b> SHHHT (tap Collect in the Friends tab)\n\n' +
+    '👥 <b>Total Referrals: ' + Number(cnt.c) + '</b>');
+  return true;
+}
+
 // ---------- User helpers ----------
 async function getOrCreateUser(tgUser, startParam = null) {
   const id = tgUser.id;
@@ -371,25 +425,17 @@ async function getOrCreateUser(tgUser, startParam = null) {
   if (!row) {
     const handle = (tgUser.first_name || tgUser.username || 'Player').toString().slice(0, 32);
 
-    await dbx.run(`
-      INSERT INTO users (
+    const nowTs = Math.floor(Date.now() / 1000);
+    const ins = await dbx.run(`
+      INSERT OR IGNORE INTO users (
         telegram_id, username, first_name, last_name, language_code, is_premium,
-        handle, balance, energy, max_energy, per_tap, last_active
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1000, 1000, 1, ?)
+        handle, balance, energy, max_energy, per_tap, last_active, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1000, 1000, 1, ?, ${nowTs}, ${nowTs})
     `, [id, tgUser.username || null, tgUser.first_name || null, tgUser.last_name || null,
       tgUser.language_code || null, tgUser.is_premium ? 1 : 0, handle, Math.floor(Date.now() / 1000)]);
 
-    if (startParam && startParam.startsWith('ref_')) {
-      const inviterId = parseInt(startParam.replace('ref_', ''), 10);
-      if (inviterId && inviterId !== id) {
-        const inviterExists = await dbx.get('SELECT 1 FROM users WHERE telegram_id = ?', [inviterId]);
-        if (inviterExists) {
-          await dbx.run('INSERT OR IGNORE INTO referrals (telegram_id, referred_by) VALUES (?, ?)', [id, inviterId]);
-          await dbx.run('INSERT OR IGNORE INTO friends (inviter_id, friend_id, premium) VALUES (?, ?, ?)', [inviterId, id, tgUser.is_premium ? 1 : 0]);
-          const reward = tgUser.is_premium ? 25000 : 5000;
-          await dbx.run('UPDATE users SET balance = balance + ? WHERE telegram_id = ?', [reward, inviterId]);
-        }
-      }
+    if (ins.changes && startParam && /^ref_\d+$/.test(startParam)) {
+      await registerReferral(parseInt(startParam.slice(4), 10), tgUser);
     }
     row = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [id]);
   } else {
@@ -416,6 +462,32 @@ const LEVEL_TABLE = [
   { name: "Master",   min: 2500000,  baseTap: 7, energy: 4000 },
   { name: "Legend",   min: 5000000,  baseTap: 8, energy: 5000 }
 ];
+// Referral reward scales with the inviter's level: base x (1 + step x levelIndex)
+let REF_CFG = { base: 5000, prem: 25000, step: 0.5, at: 0 };
+async function loadRefCfg() {
+  if (Date.now() - REF_CFG.at < 30000) return;
+  const step = Number(await getSetting('referral_level_step', '0.5'));
+  REF_CFG = { base: Number(await getSetting('referral_reward', '5000')) || 5000, prem: Number(await getSetting('referral_reward_premium', '25000')) || 25000, step: isNaN(step) ? 0.5 : step, at: Date.now() };
+}
+function refRewardsSync(balance) {
+  const idx = Math.max(0, LEVEL_TABLE.indexOf(levelFromBalance(balance)));
+  const mult = 1 + REF_CFG.step * idx;
+  return { normal: Math.round(REF_CFG.base * mult), premium: Math.round(REF_CFG.prem * mult) };
+}
+app.use('/api', async (req, res, next) => { try { await loadRefCfg(); } catch (_) {} next(); });
+async function refRewardsFor(balance) {
+  REF_CFG.at = 0; await loadRefCfg();
+  return refRewardsSync(balance);
+}
+async function _unusedRefRewardsFor(balance) {
+  const lv = levelFromBalance(balance);
+  const idx = Math.max(0, LEVEL_TABLE.indexOf(lv));
+  const step = Number(await getSetting('referral_level_step', '0.5'));
+  const mult = 1 + (isNaN(step) ? 0.5 : step) * idx;
+  const base = Number(await getSetting('referral_reward', '5000')) || 5000;
+  const prem = Number(await getSetting('referral_reward_premium', '25000')) || 25000;
+  return { normal: Math.round(base * mult), premium: Math.round(prem * mult) };
+}
 function levelFromBalance(bal) {
   const n = Number(bal) || 0;
   let lv = LEVEL_TABLE[0];
@@ -425,6 +497,10 @@ function levelFromBalance(bal) {
   return lv;
 }
 
+function regenEnergy(row, now) {
+  const dt = Math.max(0, now - (Number(row.last_active) || now));
+  return Math.min(Number(row.max_energy) || 1000, (Number(row.energy) || 0) + dt);
+}
 function userToClient(row) {
   return {
     telegramId: row.telegram_id,
@@ -440,7 +516,7 @@ function userToClient(row) {
     toLvlUp: row.to_lvl_up,
     energy: Math.floor(row.energy || 0),
     maxEnergy: row.max_energy,
-    streakDay: row.streak_day,
+    streakDay: (row.last_claim_daily && Math.floor(Date.now() / 1000) - row.last_claim_daily > 48 * 3600) ? 1 : row.streak_day,
     lastClaimDaily: row.last_claim_daily || 0,
     lastClaimAt: row.last_claim_daily || 0,
     spins: row.spins,
@@ -452,7 +528,10 @@ function userToClient(row) {
     ogPass: !!row.og_pass,
     friendEarnings: row.friend_earnings || 0,
     tapExtra: row.tap_extra || 0,
-    photo: row.photo_url || ''
+    photo: row.photo_url || '',
+    refReward: refRewardsSync(row.balance).normal,
+    refRewardPremium: refRewardsSync(row.balance).premium,
+    claimedMilestones: (() => { try { return JSON.parse(row.claimed_milestones || '{}') || {}; } catch (_) { return {}; } })()
   };
 }
 
@@ -468,6 +547,8 @@ app.post('/api/auth', authMiddleware, async (req, res) => {
   // Offline earnings
   const now = Math.floor(Date.now() / 1000);
   const lastActive = row.last_active || now;
+  row.energy = regenEnergy(row, now);
+  await dbx.run('UPDATE users SET energy = ? WHERE telegram_id = ?', [row.energy, row.telegram_id]);
   const hoursOffline = Math.min((now - lastActive) / 3600, row.mining_timer_hrs || 3);
   let offlineEarned = 0;
   if (hoursOffline > 0.05 && row.per_hour > 0) {
@@ -547,17 +628,14 @@ app.post('/api/tap', authMiddleware, async (req, res) => {
   const row = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [user.id]);
   if (!row) return res.status(404).json({ error: 'User not found' });
 
+  const nowT = Math.floor(Date.now() / 1000);
   const lv = levelFromBalance(row.balance);
   const perTap = Math.max(Number(row.per_tap) || 1, lv.baseTap);
-  const energyCost = taps;
   const gain = perTap * taps;
-  if ((row.energy || 0) < energyCost) return res.status(400).json({ error: 'Not enough energy', energy: row.energy });
-
-  await dbx.run(`
-    UPDATE users SET energy = energy - ?, balance = balance + ?, last_active = ?, updated_at = ?
-    WHERE telegram_id = ?
-  `, [energyCost, gain, Math.floor(Date.now() / 1000), Math.floor(Date.now() / 1000), user.id]);
-
+  const curEnergy = regenEnergy(row, nowT);
+  if (curEnergy < taps) return res.status(400).json({ error: 'Not enough energy', energy: Math.floor(curEnergy) });
+  await dbx.run('UPDATE users SET energy = ?, balance = balance + ?, last_active = ?, updated_at = ? WHERE telegram_id = ?',
+    [curEnergy - taps, gain, nowT, nowT, user.id]);
   const updated = await dbx.get('SELECT balance, energy FROM users WHERE telegram_id = ?', [user.id]);
   res.json({ balance: Math.floor(updated.balance), energy: Math.floor(updated.energy), earned: gain });
 });
@@ -574,14 +652,15 @@ app.post('/api/daily/claim', authMiddleware, async (req, res) => {
   }
 
   const config = await loadGameConfig();
+  if (now - (row.last_claim_daily || 0) > 48 * 3600 && row.last_claim_daily) row.streak_day = 1;
   const dayIndex = Math.min(Math.max(0, (row.streak_day || 1) - 1), (config.dailyRewards || [1000]).length - 1);
   const amount = config.dailyRewards[dayIndex] || config.dailyRewards[0] || 1000;
 
   await dbx.run(`
-    UPDATE users SET balance = balance + ?, streak_day = streak_day + 1,
+    UPDATE users SET balance = balance + ?, streak_day = ?,
       last_claim_daily = ?, last_active = ?, updated_at = ?
     WHERE telegram_id = ?
-  `, [amount, now, now, now, user.id]);
+  `, [amount, (row.streak_day || 1) + 1, now, now, now, user.id]);
 
   const updated = await dbx.get('SELECT balance, streak_day FROM users WHERE telegram_id = ?', [user.id]);
   res.json({ amount, balance: Math.floor(updated.balance), streakDay: updated.streak_day });
@@ -598,7 +677,8 @@ app.post('/api/shop/card', authMiddleware, async (req, res) => {
   if (!row) return res.status(404).json({ error: 'User not found' });
   if (row.balance < card.cost) return res.status(400).json({ error: 'Not enough balance' });
 
-  await dbx.run('UPDATE users SET balance = balance - ?, per_hour = per_hour + ?, updated_at = ? WHERE telegram_id = ?', [card.cost, card.per_hour, Math.floor(Date.now() / 1000), user.id]);
+  const paid = await dbx.run('UPDATE users SET balance = balance - ?, per_hour = per_hour + ?, updated_at = ? WHERE telegram_id = ? AND balance >= ?', [card.cost, card.per_hour, Math.floor(Date.now() / 1000), user.id, card.cost]);
+  if (!paid.changes) return res.status(400).json({ error: 'Not enough balance' });
 
   await dbx.run(`
     INSERT INTO user_cards (telegram_id, card_id, level) VALUES (?, ?, 1)
@@ -635,8 +715,8 @@ app.post('/api/shop/booster', authMiddleware, async (req, res) => {
   await dbx.run(`
     UPDATE users SET balance = balance - ?, per_tap = ?, max_energy = ?,
       mining_timer_hrs = ?, energy = ?, updated_at = ?
-    WHERE telegram_id = ?
-  `, [cost, newPerTap, newMaxEnergy, newMining, newEnergy, Math.floor(Date.now() / 1000), user.id]);
+    WHERE telegram_id = ? AND balance >= ?
+  `, [cost, newPerTap, newMaxEnergy, newMining, newEnergy, Math.floor(Date.now() / 1000), user.id, cost]);
 
   await dbx.run(`
     INSERT INTO user_boosters (telegram_id, booster_id, level) VALUES (?, ?, 1)
@@ -647,40 +727,20 @@ app.post('/api/shop/booster', authMiddleware, async (req, res) => {
   res.json({ player: userToClient(updated) });
 });
 
-// Complete task
-app.post('/api/tasks/complete', authMiddleware, async (req, res) => {
+// Complete task (atomic: reward can only be paid once)
+async function completeTask(req, res) {
   const { user } = req.tg;
-  const taskId = req.body.taskId;
-  const task = await dbx.get('SELECT * FROM tasks WHERE id = ? AND active = 1', [taskId]);
+  const task = await dbx.get('SELECT * FROM tasks WHERE id = ? AND active = 1', [req.body.taskId]);
   if (!task) return res.status(400).json({ error: 'Task not found' });
-
-  const already = await dbx.get('SELECT 1 FROM user_tasks WHERE telegram_id = ? AND task_id = ? AND done = 1', [user.id, taskId]);
-  if (already) return res.status(400).json({ error: 'Already completed' });
-
-  await dbx.run(`
-    INSERT INTO user_tasks (telegram_id, task_id, done) VALUES (?, ?, 1)
-    ON CONFLICT(telegram_id, task_id) DO UPDATE SET done = 1
-  `, [user.id, taskId]);
-
-  await dbx.run('UPDATE users SET balance = balance + ?, updated_at = ? WHERE telegram_id = ?', [task.reward, Math.floor(Date.now() / 1000), user.id]);
-
-  const updated = await dbx.get('SELECT balance FROM users WHERE telegram_id = ?', [user.id]);
-  res.json({ reward: task.reward, balance: Math.floor(updated.balance), user: userToClient(await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [user.id])) });
-});
-
-// Alias singular path used by frontend
-app.post('/api/task/complete', authMiddleware, async (req, res) => {
-  const { user } = req.tg;
-  const taskId = req.body.taskId;
-  const task = await dbx.get('SELECT * FROM tasks WHERE id = ? AND active = 1', [taskId]);
-  if (!task) return res.status(400).json({ error: 'Task not found' });
-  const already = await dbx.get('SELECT 1 FROM user_tasks WHERE telegram_id = ? AND task_id = ? AND done = 1', [user.id, taskId]);
-  if (already) return res.status(400).json({ error: 'Already completed' });
-  await dbx.run(`INSERT INTO user_tasks (telegram_id, task_id, done) VALUES (?, ?, 1) ON CONFLICT(telegram_id, task_id) DO UPDATE SET done = 1`, [user.id, taskId]);
+  const claim = await dbx.run(`INSERT INTO user_tasks (telegram_id, task_id, done) VALUES (?, ?, 1)
+    ON CONFLICT(telegram_id, task_id) DO UPDATE SET done = 1 WHERE user_tasks.done = 0`, [user.id, task.id]);
+  if (!claim.changes) return res.status(400).json({ error: 'Already completed' });
   await dbx.run('UPDATE users SET balance = balance + ?, updated_at = ? WHERE telegram_id = ?', [task.reward, Math.floor(Date.now() / 1000), user.id]);
   const full = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [user.id]);
   res.json({ reward: task.reward, balance: Math.floor(full.balance), user: userToClient(full) });
-});
+}
+app.post('/api/tasks/complete', authMiddleware, completeTask);
+app.post('/api/task/complete', authMiddleware, completeTask);
 
 // Spin
 app.post('/api/spin', authMiddleware, async (req, res) => {
@@ -692,7 +752,8 @@ app.post('/api/spin', authMiddleware, async (req, res) => {
   const prizes = [500, 1000, 2500, 5000, 10000, 25000];
   const win = prizes[Math.floor(Math.random() * prizes.length)];
 
-  await dbx.run('UPDATE users SET spins = spins - 1, balance = balance + ?, updated_at = ? WHERE telegram_id = ?', [win, Math.floor(Date.now() / 1000), user.id]);
+  const sp = await dbx.run('UPDATE users SET spins = spins - 1, balance = balance + ?, updated_at = ? WHERE telegram_id = ? AND spins > 0', [win, Math.floor(Date.now() / 1000), user.id]);
+  if (!sp.changes) return res.status(400).json({ error: 'No spins left', spins: 0 });
 
   const updated = await dbx.get('SELECT balance, spins FROM users WHERE telegram_id = ?', [user.id]);
   res.json({ win, balance: Math.floor(updated.balance), spins: updated.spins });
@@ -798,10 +859,10 @@ app.post('/api/admin/boosters', authMiddleware, adminMiddleware, async (req, res
   if (!name) return res.status(400).json({ error: 'name required' });
 
   await dbx.run(`
-    INSERT INTO boosters (id, name, desc, metric, icon, img, base_cost, effect_type, effect_value, sort_order, active)
+    INSERT INTO boosters (id, name, "desc", metric, icon, img, base_cost, effect_type, effect_value, sort_order, active)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
-      name=excluded.name, desc=excluded.desc, metric=excluded.metric,
+      name=excluded.name, "desc"=excluded."desc", metric=excluded.metric,
       icon=excluded.icon, img=excluded.img, base_cost=excluded.base_cost,
       effect_type=excluded.effect_type, effect_value=excluded.effect_value,
       sort_order=excluded.sort_order, active=excluded.active
@@ -907,7 +968,7 @@ app.get('/api/admin/all', authMiddleware, adminMiddleware, async (req, res) => {
 // ---------- Withdrawals ----------
 app.post('/api/withdrawals', authMiddleware, async (req, res) => {
   const { user } = req.tg;
-  const amount = Number(req.body.amount) || 0;
+  const amount = Math.floor(Number(req.body.amount)) || 0;
   const wallet = String(req.body.wallet || '').trim();
   if (!wallet || wallet.length < 10) return res.status(400).json({ error: 'Invalid wallet' });
 
@@ -918,18 +979,14 @@ app.post('/api/withdrawals', authMiddleware, async (req, res) => {
   if (!row) return res.status(404).json({ error: 'User not found' });
   if (row.balance < amount) return res.status(400).json({ error: 'Insufficient balance' });
 
-  let isOg = false;
-  try { isOg = !!(row.og_pass || row.is_og); } catch (_) {}
-  if (req.body && (req.body.isOg === true || req.body.isOg === 1 || req.body.isOg === 'true')) isOg = true;
-  const feePct = isOg ? 0 : (Number(await getSetting('withdrawal_fee_pct', '5')) || 5);
+  const isOg = !!row.og_pass; // never trust client-sent isOg
+  const feePct = Number(await getSetting('withdrawal_fee_pct', '5')) || 5;
   const fee = Math.floor(amount * feePct / 100);
   const receive = amount - fee;
   const now = Math.floor(Date.now() / 1000);
 
-  await dbx.run(
-    'UPDATE users SET balance = balance - ?, updated_at = ? WHERE telegram_id = ?',
-    [amount, now, user.id]
-  );
+  const taken = await dbx.run('UPDATE users SET balance = balance - ?, updated_at = ? WHERE telegram_id = ? AND balance >= ?', [amount, now, user.id, amount]);
+  if (!taken.changes) return res.status(400).json({ error: 'Insufficient balance' });
   await dbx.run(
     `INSERT INTO withdrawals (telegram_id, amount, fee_pct, receive_amount, wallet, status, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)`,
@@ -1014,17 +1071,8 @@ app.post('/api/user/sync', authMiddleware, async (req, res) => {
   const now = Math.floor(Date.now() / 1000);
   const row = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [id]);
   if (!row) return res.status(404).json({ error: 'Not found' });
-  let newBal = row.balance;
-  if (bal != null && !Number.isNaN(bal)) newBal = Math.max(Number(row.balance) || 0, bal);
-  const newEnergy = energy != null && !Number.isNaN(energy) ? Math.max(0, energy) : row.energy;
-  const newSpins = spins != null && !Number.isNaN(spins) ? Math.max(0, spins) : row.spins;
-  if (wallet) {
-    await dbx.run('UPDATE users SET balance=?, energy=?, spins=?, wallet=?, last_active=?, updated_at=? WHERE telegram_id=?',
-      [newBal, newEnergy, newSpins, String(wallet).slice(0, 128), now, now, id]);
-  } else {
-    await dbx.run('UPDATE users SET balance=?, energy=?, spins=?, last_active=?, updated_at=? WHERE telegram_id=?',
-      [newBal, newEnergy, newSpins, now, now, id]);
-  }
+  // SECURITY: balance/spins are server-authoritative; only wallet is accepted from the client
+  if (wallet) await dbx.run('UPDATE users SET wallet=?, last_active=?, updated_at=? WHERE telegram_id=?', [String(wallet).slice(0, 128), now, now, id]);
   const updated = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [id]);
   res.json({ ok: true, player: userToClient(updated), user: userToClient(updated) });
 });
@@ -1166,11 +1214,52 @@ app.get('/api/leaderboard', authMiddleware, async (req, res) => {
 });
 
 
+// ---------- Daily check-in reminder (DM via bot) ----------
+let reminderRunning = false;
+async function sendCheckinReminders() {
+  if (reminderRunning) return;
+  reminderRunning = true;
+  try {
+    if (String(await getSetting('checkin_reminder_enabled', '1')) === '0') return;
+    const hrs = Number(await getSetting('checkin_reminder_hours', '21')) || 21; // claim opens at 20h
+    const now = Math.floor(Date.now() / 1000);
+    const rows = await dbx.all(
+      `SELECT telegram_id, first_name, handle, streak_day, last_claim_daily FROM users
+       WHERE last_claim_daily > 0 AND last_claim_daily <= ? AND last_claim_daily > ?
+         AND COALESCE(last_reminder_at, 0) < last_claim_daily
+       LIMIT 500`, [now - hrs * 3600, now - 48 * 3600]);
+    const webapp = process.env.WEBAPP_URL || '';
+    for (const u of rows) {
+      // atomic lock: only one instance/run can send the reminder for this claim
+      const lock = await dbx.run('UPDATE users SET last_reminder_at = ? WHERE telegram_id = ? AND COALESCE(last_reminder_at, 0) < last_claim_daily', [now, u.telegram_id]);
+      if (!lock.changes) continue;
+      const streak = Math.max(1, (Number(u.streak_day) || 2) - 1); // streak_day is the NEXT day to claim
+      const name = escHtml(u.first_name || u.handle || 'there');
+      const text = '⏰ <b>Daily Check-in Reminder</b>\n\n' +
+        `Hey ${name}! You haven't claimed your daily reward yet.\n\n` +
+        `🔥 Your current streak is <b>${streak} day${streak === 1 ? '' : 's'}</b> — don't lose it!\n\n` +
+        '🎁 Open the app and tap Check In to collect your $SHHHT bonus!';
+      const kb = webapp ? { inline_keyboard: [[{ text: '🎁 Check In Now', web_app: { url: webapp } }]] } : undefined;
+      await tgSend(u.telegram_id, text, kb);
+      await new Promise(z => setTimeout(z, 60)); // stay under Telegram's ~30 msg/s
+    }
+  } catch (e) {
+    console.error('checkin reminder job', e);
+  } finally {
+    reminderRunning = false;
+  }
+}
+function startReminderJob() {
+  setTimeout(sendCheckinReminders, 30 * 1000);
+  setInterval(sendCheckinReminders, 10 * 60 * 1000);
+}
+
 // Start
 (async () => {
   try {
     await ensureDb();
     await seedIfEmpty();
+    await getSpinPackages(); // seeds default spin packs on first run
     
 // ---------- Aliases frontend expects ----------
 app.post('/api/user/checkin', authMiddleware, async (req, res) => {
@@ -1186,8 +1275,9 @@ app.post('/api/user/checkin', authMiddleware, async (req, res) => {
 
     const config = await loadGameConfig();
     const rewards = config.dailyRewards || [2500, 5000, 7500, 10000, 15000, 20000, 30000];
-    const streak = Math.max(0, Number(row.streak_day) || 0);
-    const dayIndex = Math.min(streak, rewards.length - 1);
+    let streak = Math.max(1, Number(row.streak_day) || 1);
+    if (row.last_claim_daily && now - row.last_claim_daily > 48 * 3600) streak = 1;
+    const dayIndex = Math.min(streak - 1, rewards.length - 1);
     const amount = rewards[dayIndex] || rewards[0] || 2500;
 
     await dbx.run(`
@@ -1216,13 +1306,16 @@ app.post('/api/user/checkin', authMiddleware, async (req, res) => {
 app.post('/api/stars/invoice', authMiddleware, async (req, res) => {
   try {
     const kind = String(req.body.kind || 'spinpack');
-    const stars = Number(req.body.stars) || 0;
+    let stars = 0;
+    if (kind === 'ogpass') stars = Number(await getSetting('og_pass_stars_price', '100')) || 100;
+    else if (kind === 'spinpack') { const pk = (await getSpinPackages()).find(p => p.id === req.body.packId); stars = pk ? Number(pk.price_stars) : 0; }
+    else if (kind === 'incomecard') { const c = await dbx.get('SELECT cost FROM cards WHERE id = ?', [req.body.cardId]); stars = c ? Math.max(1, Math.ceil(c.cost / 100)) : 0; }
+    else stars = Number(req.body.stars) || 0;
     const title = kind === 'ogpass' ? 'OG Pass' : kind === 'spinpack' ? 'Spin Pack' : 'Purchase';
     const description = title + ' — ShhhToshi';
     const payload = JSON.stringify({
       kind,
       packId: req.body.packId || null,
-      spins: req.body.spins || null,
       cardId: req.body.cardId || null,
       boost_id: req.body.boost_id || null,
       uid: req.tg.user.id
@@ -1277,18 +1370,16 @@ app.post('/api/shop/spin-pack', authMiddleware, async (req, res) => {
     if (!row) return res.status(404).json({ error: 'User not found' });
 
     const costSp = Number(pack.price_sp) || 0;
+    if (costSp <= 0) return res.status(402).json({ error: 'Pay with Stars — spins are granted automatically after payment' });
     if (costSp > 0 && (row.balance || 0) < costSp) {
       return res.status(400).json({ error: 'Not enough balance' });
     }
 
     const now = Math.floor(Date.now() / 1000);
     if (costSp > 0) {
-      await dbx.run('UPDATE users SET balance = balance - ?, spins = spins + ?, updated_at = ? WHERE telegram_id = ?',
-        [costSp, spins, now, user.id]);
-    } else {
-      // Stars / free grant after invoice flow
-      await dbx.run('UPDATE users SET spins = spins + ?, updated_at = ? WHERE telegram_id = ?',
-        [spins, now, user.id]);
+      const pd = await dbx.run('UPDATE users SET balance = balance - ?, spins = spins + ?, updated_at = ? WHERE telegram_id = ? AND balance >= ?',
+        [costSp, spins, now, user.id, costSp]);
+      if (!pd.changes) return res.status(400).json({ error: 'Not enough balance' });
     }
     const updated = await dbx.get('SELECT balance, spins FROM users WHERE telegram_id = ?', [user.id]);
     res.json({ ok: true, spins: updated.spins, balance: Math.floor(updated.balance) });
@@ -1306,11 +1397,164 @@ app.post('/api/user/wallet', authMiddleware, async (req, res) => {
 });
 
 
+// ---------- Endpoints the frontend calls that were missing ----------
+const INTERNAL_SECRET = crypto.createHash('sha256').update('internal:' + BOT_TOKEN).digest('hex');
+app.post('/api/internal/payment', async (req, res) => {
+  if (req.headers['x-internal-secret'] !== INTERNAL_SECRET) return res.status(403).json({ error: 'forbidden' });
+  const { charge_id, payload } = req.body || {};
+  let p; try { p = JSON.parse(payload); } catch (_) { return res.status(400).json({ error: 'bad payload' }); }
+  const seen = await dbx.get('SELECT key FROM settings WHERE key = ?', ['paid_' + charge_id]);
+  if (seen) return res.json({ ok: true, duplicate: true });
+  await dbx.run('INSERT INTO settings (key, value) VALUES (?, ?)', ['paid_' + charge_id, '1']);
+  const now = Math.floor(Date.now() / 1000), uid = Number(p.uid);
+  if (p.kind === 'ogpass') await dbx.run('UPDATE users SET og_pass = 1, updated_at = ? WHERE telegram_id = ?', [now, uid]);
+  else if (p.kind === 'spinpack') {
+    const pk = (await getSpinPackages()).find(x => x.id === p.packId);
+    if (pk) await dbx.run('UPDATE users SET spins = spins + ?, updated_at = ? WHERE telegram_id = ?', [Number(pk.spins) || 0, now, uid]);
+  } else if (p.kind === 'incomecard' && p.cardId) {
+    const c = await dbx.get('SELECT * FROM cards WHERE id = ?', [p.cardId]);
+    if (c) {
+      await dbx.run('UPDATE users SET per_hour = per_hour + ?, updated_at = ? WHERE telegram_id = ?', [c.per_hour, now, uid]);
+      await dbx.run('INSERT INTO user_cards (telegram_id, card_id, level) VALUES (?, ?, 1) ON CONFLICT(telegram_id, card_id) DO UPDATE SET level = user_cards.level + 1', [uid, c.id]);
+    }
+  }
+  res.json({ ok: true });
+});
+app.post('/api/internal/referral', async (req, res) => {
+  if (req.headers['x-internal-secret'] !== INTERNAL_SECRET) return res.status(403).json({ error: 'forbidden' });
+  const u = (req.body && req.body.user) || {};
+  const inviterId = Number(req.body && req.body.inviter_id);
+  if (!u.id || !inviterId) return res.status(400).json({ error: 'bad request' });
+  const now = Math.floor(Date.now() / 1000);
+  const handle = String(u.first_name || u.username || 'Player').slice(0, 32);
+  const ins = await dbx.run(`INSERT OR IGNORE INTO users (telegram_id, username, first_name, language_code, is_premium, handle, balance, energy, max_energy, per_tap, last_active, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, 0, 1000, 1000, 1, ?, ?, ?)`, [u.id, u.username || null, u.first_name || null, u.language_code || null, u.is_premium ? 1 : 0, handle, now, now, now]);
+  // only brand-new players count as referrals (stops farming with old accounts)
+  const counted = ins.changes ? await registerReferral(inviterId, u) : false;
+  res.json({ ok: true, counted });
+});
+// Payment is granted by the bot webhook above; confirm just reports current state
+app.post('/api/stars/confirm', authMiddleware, async (req, res) => {
+  const row = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [req.tg.user.id]);
+  res.json({ ok: true, user: userToClient(row), player: userToClient(row) });
+});
+const FRIEND_MILESTONES = { 1: 500, 3: 1500, 5: 3000, 10: 8000, 20: 20000, 50: 50000 };
+async function withRefRewards(u, row) {
+  const rr = await refRewardsFor(row.balance);
+  u.refReward = rr.normal; u.refRewardPremium = rr.premium;
+  return u;
+}
+app.post('/api/friends/collect', authMiddleware, async (req, res) => {
+  const row = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [req.tg.user.id]);
+  const amount = Math.floor(Number(row.friend_earnings) || 0);
+  if (amount <= 0) return res.status(400).json({ error: 'Nothing to collect' });
+  const r = await dbx.run('UPDATE users SET balance = balance + ?, friend_earnings = friend_earnings - ?, updated_at = ? WHERE telegram_id = ? AND friend_earnings >= ?',
+    [amount, amount, Math.floor(Date.now() / 1000), row.telegram_id, amount]);
+  if (!r.changes) return res.status(409).json({ error: 'Try again' });
+  const u = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [row.telegram_id]);
+  res.json({ ok: true, amount, user: await withRefRewards(userToClient(u), u) });
+});
+
+let BOT_USERNAME_CACHE = process.env.BOT_USERNAME || '';
+async function botUsername() {
+  if (BOT_USERNAME_CACHE) return BOT_USERNAME_CACHE.replace('@', '');
+  const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getMe`).then(x => x.json()).catch(() => null);
+  if (r && r.ok) BOT_USERNAME_CACHE = r.result.username;
+  return BOT_USERNAME_CACHE;
+}
+const DEFAULT_INVITE_MSG = 'Join me on ShhhToshi 🚀 Tap, earn $SHHHT, spin & climb the ranks!';
+// Message with admin-editable text + inline "Join Me" button (Bot API savePreparedInlineMessage -> WebApp.shareMessage)
+app.post('/api/invite/prepare', authMiddleware, async (req, res) => {
+  const uid = req.tg.user.id;
+  const bot = await botUsername();
+  if (!bot) return res.status(500).json({ error: 'Bot username unavailable' });
+  const text = (await getSetting('invite_message', DEFAULT_INVITE_MSG)) || DEFAULT_INVITE_MSG;
+  const btn = (await getSetting('invite_button_text', 'Join Me')) || 'Join Me';
+  const result = {
+    type: 'article', id: 'invite_' + uid, title: btn, description: text.slice(0, 100),
+    input_message_content: { message_text: text },
+    reply_markup: { inline_keyboard: [[{ text: btn, url: `https://t.me/${bot}?start=ref_${uid}` }]] }
+  };
+  const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/savePreparedInlineMessage`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: uid, result, allow_user_chats: true, allow_group_chats: true, allow_channel_chats: true, allow_bot_chats: false })
+  }).then(x => x.json()).catch(() => null);
+  if (!r || !r.ok) return res.status(502).json({ error: (r && r.description) || 'Could not prepare message' });
+  res.json({ ok: true, id: r.result.id });
+});
+app.post('/api/friends/milestone', authMiddleware, async (req, res) => {
+  const need = Number(req.body.need), reward = FRIEND_MILESTONES[need];
+  if (!reward) return res.status(400).json({ error: 'Invalid milestone' });
+  const row = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [req.tg.user.id]);
+  const cnt = await dbx.get('SELECT COUNT(*) AS c FROM friends WHERE inviter_id = ?', [row.telegram_id]);
+  if (Number(cnt.c) < need) return res.status(400).json({ error: 'Invite more friends' });
+  let cm = {}; try { cm = JSON.parse(row.claimed_milestones || '{}') || {}; } catch (_) {}
+  const key = 'fm_' + need;
+  if (cm[key]) return res.status(400).json({ error: 'Already claimed' });
+  cm[key] = true;
+  const ok = await dbx.run('UPDATE users SET claimed_milestones = ?, balance = balance + ?, updated_at = ? WHERE telegram_id = ? AND claimed_milestones = ?',
+    [JSON.stringify(cm), reward, Math.floor(Date.now() / 1000), row.telegram_id, row.claimed_milestones || '{}']);
+  if (!ok.changes) return res.status(409).json({ error: 'Try again' });
+  const u = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [row.telegram_id]);
+  res.json({ ok: true, reward, user: userToClient(u) });
+});
+app.get('/api/spin/status', authMiddleware, async (req, res) => {
+  const row = await dbx.get('SELECT spins FROM users WHERE telegram_id = ?', [req.tg.user.id]);
+  res.json({ spins: row ? row.spins : 0, price: Number(await getSetting('spin_price', '1')) || 1 });
+});
+app.get('/api/income-cards', authMiddleware, async (req, res) => {
+  const cards = await getCards();
+  const owned = await dbx.all('SELECT card_id, level FROM user_cards WHERE telegram_id = ?', [req.tg.user.id]);
+  res.json({ cards: cards.map(c => { const o = owned.find(x => x.card_id === c.id); return { id: c.id, title: c.name, sp_per_hour: c.per_hour, image_url: c.img || '', category: c.category, name: c.name, per_hour: c.per_hour, perHour: c.per_hour, cost: c.cost, price_sp: c.cost, locked: !!c.locked, img: c.img || '', level: o ? o.level : 0, pay_methods: ['sp'] }; }) });
+});
+app.post('/api/income-cards/buy', authMiddleware, async (req, res) => {
+  const card = await dbx.get('SELECT * FROM cards WHERE id = ? AND active = 1', [req.body.card_id]);
+  if (!card || card.locked) return res.status(400).json({ error: 'Card not available' });
+  if (req.body.method && req.body.method !== 'sp') return res.status(400).json({ error: 'Use Stars (paid via bot) or balance' });
+  const paid = await dbx.run('UPDATE users SET balance = balance - ?, per_hour = per_hour + ?, updated_at = ? WHERE telegram_id = ? AND balance >= ?', [card.cost, card.per_hour, Math.floor(Date.now() / 1000), req.tg.user.id, card.cost]);
+  if (!paid.changes) return res.status(400).json({ error: 'Not enough balance' });
+  await dbx.run('INSERT INTO user_cards (telegram_id, card_id, level) VALUES (?, ?, 1) ON CONFLICT(telegram_id, card_id) DO UPDATE SET level = user_cards.level + 1', [req.tg.user.id, card.id]);
+  const u = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [req.tg.user.id]);
+  res.json({ ok: true, balance: Math.floor(u.balance), perHour: u.per_hour, user: userToClient(u) });
+});
+app.post('/api/settings', authMiddleware, adminMiddleware, async (req, res) => {
+  for (const [k, v] of Object.entries(req.body || {})) if (/^[a-z0-9_]+$/i.test(k) && !k.startsWith('paid_')) await setSetting(k, v);
+  res.json({ ok: true });
+});
+app.post('/api/task/verify-telegram', authMiddleware, async (req, res) => {
+  const task = await dbx.get('SELECT * FROM tasks WHERE id = ? AND active = 1', [req.body.taskId]);
+  if (!task) return res.status(400).json({ error: 'Task not found' });
+  const chat = req.body.chatId || (String(task.link || '').match(/t\.me\/([A-Za-z0-9_]+)/) || [])[1];
+  if (!chat) return res.json({ ok: true });
+  const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: String(chat).startsWith('-') || /^\d+$/.test(chat) ? chat : '@' + chat, user_id: req.tg.user.id }) }).then(x => x.json()).catch(() => null);
+  if (!r || !r.ok) return res.json({ ok: true, unverified: true }); // bot not admin in chat: can't verify
+  if (['left', 'kicked'].includes(r.result.status)) return res.status(400).json({ error: 'Join the channel first' });
+  res.json({ ok: true });
+});
+app.post('/api/ogpass/prepare', authMiddleware, async (req, res) => res.status(501).json({ error: 'Gram payment not available yet — use Stars' }));
+app.post('/api/ogpass/buy', authMiddleware, async (req, res) => res.status(501).json({ error: 'Gram payment not available yet — use Stars' }));
+app.post('/api/shop-boosts/claim', authMiddleware, async (req, res) => {
+  if (req.body.payment_ok) return res.status(402).json({ error: 'Payment not verified' });
+  const b = await dbx.get('SELECT * FROM boosters WHERE id = ? AND active = 1', [req.body.boost_id]);
+  if (!b) return res.status(400).json({ error: 'Booster not available' });
+  const uid = req.tg.user.id, now = Math.floor(Date.now() / 1000), cost = Number(b.base_cost) || 0, v = Number(b.effect_value) || 1;
+  const row = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [uid]);
+  const col = { multitap: 'per_tap', energy_limit: 'max_energy', mining_timer: 'mining_timer_hrs' }[b.effect_type];
+  const sets = col ? `${col} = ${col} + ?` : (b.effect_type === 'full_energy' ? 'energy = max_energy' : null);
+  if (!sets) return res.status(400).json({ error: 'Booster not available' });
+  const r = await dbx.run(`UPDATE users SET balance = balance - ?, ${sets}, updated_at = ? WHERE telegram_id = ? AND balance >= ?`,
+    col ? [cost, v, now, uid, cost] : [cost, now, uid, cost]);
+  if (!r.changes) return res.status(400).json({ error: 'Not enough balance' });
+  await dbx.run('INSERT INTO user_boosters (telegram_id, booster_id, level) VALUES (?, ?, 1) ON CONFLICT(telegram_id, booster_id) DO UPDATE SET level = user_boosters.level + 1', [uid, b.id]);
+  res.json({ ok: true });
+});
+
 app.get('/api/health', async (req, res) => {
       res.json({ ok: true, ts: Date.now(), db: dbx.isPg() ? 'postgres' : 'sqlite' });
     });
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`SHHHT backend on :${PORT}  db=${dbx.isPg() ? 'postgres/supabase' : 'sqlite'}`);
+      startReminderJob();
       console.log(`Admin IDs: ${ADMIN_TELEGRAM_IDS.join(', ') || '(none set)'}`);
     });
   } catch (e) {

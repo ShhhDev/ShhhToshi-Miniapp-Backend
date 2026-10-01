@@ -1,12 +1,10 @@
 {
   "name": "shhhtoshi-backend",
-  "version": "1.3.0",
-  "description": "ShhhToshi API + Telegram bot — ShhhDev",
+  "version": "1.3.1",
+  "private": true,
   "main": "server.js",
   "scripts": {
-    "start": "bash start.sh",
-    "start:api": "node server.js",
-    "start:bot": "python3 bot.py"
+    "start": "bash start.sh"
   },
   "engines": { "node": ">=18" },
   "dependencies": {
