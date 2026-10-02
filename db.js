@@ -61,6 +61,8 @@ async function migratePg() {
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url TEXT DEFAULT ''",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS ref_code TEXT DEFAULT ''",
     'ALTER TABLE users ADD COLUMN IF NOT EXISTS last_reminder_at BIGINT DEFAULT 0',
+    'ALTER TABLE users ADD COLUMN IF NOT EXISTS energy_bonus INTEGER',
+    "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS block_id TEXT DEFAULT ''",
   ];
   for (const sql of alters) {
     try { await pool.query(sql); } catch (e) { /* ignore */ }

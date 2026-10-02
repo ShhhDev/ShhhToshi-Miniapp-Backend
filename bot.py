@@ -64,6 +64,7 @@ DATA_DIR.mkdir(exist_ok=True)
 WELCOME_PATH = DATA_DIR / "welcome.json"
 USERS_PATH = DATA_DIR / "users.json"
 DRAFT_PATH = DATA_DIR / "broadcast_draft.json"
+INVITE_DRAFT_PATH = DATA_DIR / "invite_draft.json"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -78,7 +79,8 @@ logger = logging.getLogger(__name__)
     WAIT_BUTTON,
     WAIT_BROADCAST_CONTENT,
     WAIT_BROADCAST_BUTTONS,
-) = range(5)
+    WAIT_INVITE_MSG,
+) = range(6)
 
 DEFAULT_WELCOME = {
     "text": (
@@ -416,6 +418,10 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/addbutton Label | https://url\n"
         "/listbuttons · /clearbuttons\n"
         "/preview — see welcome as users see it\n\n"
+        "<b>Invite message</b>\n"
+        "/changemsg — set text / photo / GIF / video\n"
+        "/previewmsg — preview the draft\n"
+        "/applymsg — publish the draft\n\n"
         "<b>Broadcast</b>\n"
         "/broadcast — send text / photo / GIF / sticker / video\n"
         "Then optionally add buttons, get <b>preview</b>\n"
@@ -439,6 +445,89 @@ async def preview_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # ---------- Welcome text ----------
+
+# ---------- Invite message (/changemsg -> /previewmsg -> /applymsg) ----------
+
+def _invite_payload(msg) -> Optional[dict]:
+    if msg.photo:
+        return {"type": "photo", "file_id": msg.photo[-1].file_id, "text": msg.caption_html or ""}
+    if msg.animation:
+        return {"type": "animation", "file_id": msg.animation.file_id, "text": msg.caption_html or ""}
+    if msg.video:
+        return {"type": "video", "file_id": msg.video.file_id, "text": msg.caption_html or ""}
+    if msg.text:
+        return {"type": "text", "file_id": None, "text": msg.text_html}
+    return None
+
+
+def _load_invite_draft() -> Optional[dict]:
+    try:
+        return json.loads(INVITE_DRAFT_PATH.read_text(encoding="utf-8")) if INVITE_DRAFT_PATH.exists() else None
+    except Exception:
+        return None
+
+
+async def changemsg_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await admin_only(update):
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "Send the new <b>invite message</b> — text, or a photo / GIF / video with a caption.\n"
+        "Formatting (bold, links…) is kept. The <b>Join Me</b> button with the user's invite link is added automatically.\n\n"
+        "/cancel to abort.",
+        parse_mode=ParseMode.HTML,
+    )
+    return WAIT_INVITE_MSG
+
+
+async def changemsg_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    payload = _invite_payload(update.message)
+    if not payload or (payload["type"] == "text" and not payload["text"].strip()):
+        await update.message.reply_text("Send text, a photo, a GIF or a video (or /cancel).")
+        return WAIT_INVITE_MSG
+    INVITE_DRAFT_PATH.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    await update.message.reply_text(
+        "Draft saved ✅\n/previewmsg — see how users will get it\n/applymsg — publish it\n/changemsg — replace the draft"
+    )
+    return ConversationHandler.END
+
+
+async def previewmsg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await admin_only(update):
+        return
+    draft = _load_invite_draft()
+    if not draft:
+        await update.message.reply_text("No draft yet. Use /changemsg first.")
+        return
+    uid = update.effective_user.id
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Join Me", url=f"https://t.me/{context.bot.username}?start=ref_{uid}")]]
+    )
+    await update.message.reply_text("Preview of the invite message:")
+    await send_payload(context.bot, update.effective_chat.id, draft, reply_markup=kb)
+    await update.message.reply_text("Happy with it? /applymsg to publish.")
+
+
+async def applymsg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await admin_only(update):
+        return
+    draft = _load_invite_draft()
+    if not draft:
+        await update.message.reply_text("No draft to publish. Use /changemsg first.")
+        return
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(
+                f"{API_URL}/api/internal/invite-msg",
+                headers={"x-internal-secret": INTERNAL_SECRET},
+                json=draft,
+            )
+            r.raise_for_status()
+        INVITE_DRAFT_PATH.unlink(missing_ok=True)
+        await update.message.reply_text("Invite message updated ✅ New invites use it right away.")
+    except Exception as e:
+        logger.error("apply invite msg failed: %s", e)
+        await update.message.reply_text("Could not publish right now. Try again in a moment.")
+
 
 async def setwelcome_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await admin_only(update):
@@ -776,6 +865,22 @@ def main() -> None:
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, paid))
 
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[CommandHandler("changemsg", changemsg_start)],
+            states={
+                WAIT_INVITE_MSG: [
+                    MessageHandler(
+                        (filters.TEXT | filters.PHOTO | filters.ANIMATION | filters.VIDEO) & ~filters.COMMAND,
+                        changemsg_save,
+                    )
+                ],
+            },
+            fallbacks=[CommandHandler("cancel", cancel_cmd)],
+        )
+    )
+    app.add_handler(CommandHandler("previewmsg", previewmsg_cmd))
+    app.add_handler(CommandHandler("applymsg", applymsg_cmd))
     app.add_handler(
         ConversationHandler(
             entry_points=[CommandHandler("setwelcome", setwelcome_start)],
