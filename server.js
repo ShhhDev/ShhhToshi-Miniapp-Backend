@@ -19,6 +19,7 @@ const app = express();
 ['get','post','put','delete'].forEach(m=>{const o=app[m].bind(app);app[m]=(p,...h)=>o(p,...h.map(f=>typeof f==='function'&&f.length<4?(q,r,n)=>Promise.resolve(f(q,r,n)).catch(e=>{console.error(m,p,e);if(!r.headersSent)r.status(500).json({error:'Server error'});}):f));});
 process.on('unhandledRejection',e=>console.error('unhandledRejection',e));
 const PORT = process.env.PORT || 3000;
+const DEFAULT_INVITE_MSG = 'Join me on ShhhToshi 🚀 Tap, earn $SHHHT, spin & climb the ranks!';
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_TELEGRAM_IDS = (process.env.ADMIN_TELEGRAM_IDS || '')
   .split(',')
@@ -131,6 +132,7 @@ async function ensureDb() {
   if (!dbx.isPg()) {
     try { await dbx.exec('ALTER TABLE users ADD COLUMN last_reminder_at INTEGER DEFAULT 0'); } catch (_) { /* already exists */ }
   }
+  await dbx.exec('CREATE TABLE IF NOT EXISTS task_claims (telegram_id BIGINT, task_id TEXT, day INTEGER, cnt INTEGER DEFAULT 0, last_at BIGINT DEFAULT 0, PRIMARY KEY (telegram_id, task_id, day))');
   dbReady = true;
 }
 
@@ -363,6 +365,7 @@ function authMiddleware(req, res, next) {
   const initData = req.headers['x-telegram-init-data'] || req.body?.initData;
   const validated = validateInitData(initData);
   if (!validated) {
+    console.warn('[auth] rejected:', !initData ? 'no initData sent (not opened inside Telegram?)' : (BOT_TOKEN ? 'bad signature or older than 24h — BOT_TOKEN may not match this bot' : 'BOT_TOKEN env var is NOT set'), req.method, req.path);
     return res.status(401).json({ error: 'Invalid or expired Telegram auth. Open the Mini App inside Telegram.' });
   }
   req.tg = validated;
@@ -463,16 +466,16 @@ const LEVEL_TABLE = [
   { name: "Legend",   min: 5000000,  baseTap: 8, energy: 5000 }
 ];
 // Referral reward scales with the inviter's level: base x (1 + step x levelIndex)
-let REF_CFG = { base: 5000, prem: 25000, step: 0.5, at: 0 };
+let REF_CFG = { base: 1000, step: 0, at: 0 };
 async function loadRefCfg() {
   if (Date.now() - REF_CFG.at < 30000) return;
   const step = Number(await getSetting('referral_level_step', '0.5'));
-  REF_CFG = { base: Number(await getSetting('referral_reward', '5000')) || 5000, prem: Number(await getSetting('referral_reward_premium', '25000')) || 25000, step: isNaN(step) ? 0.5 : step, at: Date.now() };
+  REF_CFG = { base: Number(await getSetting('referral_base_reward', '1000')) || 1000, step, at: Date.now() };
 }
 function refRewardsSync(balance) {
   const idx = Math.max(0, LEVEL_TABLE.indexOf(levelFromBalance(balance)));
-  const mult = 1 + REF_CFG.step * idx;
-  return { normal: Math.round(REF_CFG.base * mult), premium: Math.round(REF_CFG.prem * mult) };
+  const normal = Math.round(REF_CFG.base * Math.pow(1.5, idx));
+  return { normal, premium: Math.round(normal * 1.5) };
 }
 app.use('/api', async (req, res, next) => { try { await loadRefCfg(); } catch (_) {} next(); });
 async function refRewardsFor(balance) {
@@ -541,6 +544,7 @@ function userToClient(row) {
 // Auth + full state
 app.post('/api/auth', authMiddleware, async (req, res) => {
   const { user, startParam } = req.tg;
+  console.log('[auth] ok user', user.id);
   const row = await getOrCreateUser(user, startParam);
   const config = await loadGameConfig();
 
@@ -594,7 +598,7 @@ app.post('/api/auth', authMiddleware, async (req, res) => {
     offlineEarned,
     config: {
       ...config,
-      tasks: config.tasks.map(t => ({ ...t, done: doneTasks.includes(t.id) })),
+      tasks: config.tasks.map(t => { const rep = t.section === 'watch'; return { ...t, repeatable: rep, done: rep ? false : doneTasks.includes(t.id) }; }),
       boosters: boostersWithLevel
     },
     ownedCards,
@@ -732,12 +736,28 @@ async function completeTask(req, res) {
   const { user } = req.tg;
   const task = await dbx.get('SELECT * FROM tasks WHERE id = ? AND active = 1', [req.body.taskId]);
   if (!task) return res.status(400).json({ error: 'Task not found' });
-  const claim = await dbx.run(`INSERT INTO user_tasks (telegram_id, task_id, done) VALUES (?, ?, 1)
-    ON CONFLICT(telegram_id, task_id) DO UPDATE SET done = 1 WHERE user_tasks.done = 0`, [user.id, task.id]);
-  if (!claim.changes) return res.status(400).json({ error: 'Already completed' });
-  await dbx.run('UPDATE users SET balance = balance + ?, updated_at = ? WHERE telegram_id = ?', [task.reward, Math.floor(Date.now() / 1000), user.id]);
+  const now = Math.floor(Date.now() / 1000);
+  if (task.section === 'watch') {
+    // repeatable (ads): per-day cap + cooldown, enforced atomically
+    const cooldown = Number(await getSetting('watch_cooldown_sec', '30')) || 30;
+    const cap = Number(await getSetting('watch_daily_cap', '20')) || 20;
+    const day = Math.floor(now / 86400);
+    await dbx.run('INSERT OR IGNORE INTO task_claims (telegram_id, task_id, day, cnt, last_at) VALUES (?, ?, ?, 0, 0)', [user.id, task.id, day]);
+    const c = await dbx.run('UPDATE task_claims SET cnt = cnt + 1, last_at = ? WHERE telegram_id = ? AND task_id = ? AND day = ? AND cnt < ? AND last_at <= ?',
+      [now, user.id, task.id, day, cap, now - cooldown]);
+    if (!c.changes) {
+      const st = await dbx.get('SELECT cnt, last_at FROM task_claims WHERE telegram_id = ? AND task_id = ? AND day = ?', [user.id, task.id, day]);
+      if (st && st.cnt >= cap) return res.status(429).json({ error: 'Daily limit reached — come back tomorrow' });
+      return res.status(429).json({ error: 'Wait ' + Math.max(1, cooldown - (now - (st ? st.last_at : 0))) + 's before the next one' });
+    }
+  } else {
+    const claim = await dbx.run(`INSERT INTO user_tasks (telegram_id, task_id, done) VALUES (?, ?, 1)
+      ON CONFLICT(telegram_id, task_id) DO UPDATE SET done = 1 WHERE user_tasks.done = 0`, [user.id, task.id]);
+    if (!claim.changes) return res.status(400).json({ error: 'Already completed' });
+  }
+  await dbx.run('UPDATE users SET balance = balance + ?, updated_at = ? WHERE telegram_id = ?', [task.reward, now, user.id]);
   const full = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [user.id]);
-  res.json({ reward: task.reward, balance: Math.floor(full.balance), user: userToClient(full) });
+  res.json({ reward: task.reward, balance: Math.floor(full.balance), repeatable: task.section === 'watch', user: userToClient(full) });
 }
 app.post('/api/tasks/complete', authMiddleware, completeTask);
 app.post('/api/task/complete', authMiddleware, completeTask);
@@ -1462,7 +1482,6 @@ async function botUsername() {
   if (r && r.ok) BOT_USERNAME_CACHE = r.result.username;
   return BOT_USERNAME_CACHE;
 }
-const DEFAULT_INVITE_MSG = 'Join me on ShhhToshi 🚀 Tap, earn $SHHHT, spin & climb the ranks!';
 // Message with admin-editable text + inline "Join Me" button (Bot API savePreparedInlineMessage -> WebApp.shareMessage)
 app.post('/api/invite/prepare', authMiddleware, async (req, res) => {
   const uid = req.tg.user.id;
