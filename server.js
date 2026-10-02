@@ -132,6 +132,7 @@ async function ensureDb() {
   if (!dbx.isPg()) {
     try { await dbx.exec('ALTER TABLE users ADD COLUMN last_reminder_at INTEGER DEFAULT 0'); } catch (_) { /* already exists */ }
   }
+  await dbx.exec('CREATE TABLE IF NOT EXISTS ton_orders (nonce TEXT PRIMARY KEY, telegram_id BIGINT, kind TEXT, amount_ton REAL, created_at BIGINT, status TEXT, tx_hash TEXT)');
   await dbx.exec('CREATE TABLE IF NOT EXISTS task_claims (telegram_id BIGINT, task_id TEXT, day INTEGER, cnt INTEGER DEFAULT 0, last_at BIGINT DEFAULT 0, PRIMARY KEY (telegram_id, task_id, day))');
   dbReady = true;
 }
@@ -500,6 +501,11 @@ function levelFromBalance(bal) {
   return lv;
 }
 
+// Friendly TON addresses: EQ../UQ.. = mainnet, kQ../0Q.. = testnet. Raw (0:hex) can't be told apart, so it is allowed.
+function isTestnetAddr(a) {
+  a = String(a || '').trim();
+  return /^[A-Za-z0-9_-]{48}$/.test(a) && !'EU'.includes(a[0]);
+}
 function regenEnergy(row, now) {
   const dt = Math.max(0, now - (Number(row.last_active) || now));
   return Math.min(Number(row.max_energy) || 1000, (Number(row.energy) || 0) + dt);
@@ -991,6 +997,7 @@ app.post('/api/withdrawals', authMiddleware, async (req, res) => {
   const amount = Math.floor(Number(req.body.amount)) || 0;
   const wallet = String(req.body.wallet || '').trim();
   if (!wallet || wallet.length < 10) return res.status(400).json({ error: 'Invalid wallet' });
+  if (isTestnetAddr(wallet)) return res.status(400).json({ error: 'Testnet wallets are not allowed. Use a Mainnet wallet.' });
 
   const minAmt = Number(await getSetting('withdrawal_min', '1000')) || 1000;
   if (amount < minAmt) return res.status(400).json({ error: 'Below minimum (' + minAmt + ')' });
@@ -1076,6 +1083,7 @@ app.post('/api/admin/verify-password', authMiddleware, adminMiddleware, async (r
 app.post('/api/wallet', authMiddleware, async (req, res) => {
   const wallet = String(req.body?.wallet || '').trim();
   if (!wallet) return res.status(400).json({ error: 'wallet required' });
+  if (isTestnetAddr(wallet)) return res.status(400).json({ error: 'Testnet wallets are not allowed. Use a Mainnet wallet.' });
   await dbx.run('UPDATE users SET wallet = ?, updated_at = ? WHERE telegram_id = ?', [wallet, Math.floor(Date.now() / 1000), req.tg.user.id]);
   res.json({ ok: true, wallet });
 });
@@ -1092,7 +1100,7 @@ app.post('/api/user/sync', authMiddleware, async (req, res) => {
   const row = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [id]);
   if (!row) return res.status(404).json({ error: 'Not found' });
   // SECURITY: balance/spins are server-authoritative; only wallet is accepted from the client
-  if (wallet) await dbx.run('UPDATE users SET wallet=?, last_active=?, updated_at=? WHERE telegram_id=?', [String(wallet).slice(0, 128), now, now, id]);
+  if (wallet && !isTestnetAddr(wallet)) await dbx.run('UPDATE users SET wallet=?, last_active=?, updated_at=? WHERE telegram_id=?', [String(wallet).slice(0, 128), now, now, id]);
   const updated = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [id]);
   res.json({ ok: true, player: userToClient(updated), user: userToClient(updated) });
 });
@@ -1411,6 +1419,7 @@ app.post('/api/shop/spin-pack', authMiddleware, async (req, res) => {
 app.post('/api/user/wallet', authMiddleware, async (req, res) => {
   const addr = String(req.body.wallet_address || req.body.wallet || '').trim();
   if (!addr) return res.status(400).json({ error: 'wallet required' });
+  if (isTestnetAddr(addr)) return res.status(400).json({ error: 'Testnet wallets are not allowed. Use a Mainnet wallet.' });
   await dbx.run('UPDATE users SET wallet = ?, updated_at = ? WHERE telegram_id = ?',
     [addr, Math.floor(Date.now() / 1000), req.tg.user.id]);
   res.json({ ok: true, wallet: addr });
@@ -1550,8 +1559,38 @@ app.post('/api/task/verify-telegram', authMiddleware, async (req, res) => {
   if (['left', 'kicked'].includes(r.result.status)) return res.status(400).json({ error: 'Join the channel first' });
   res.json({ ok: true });
 });
-app.post('/api/ogpass/prepare', authMiddleware, async (req, res) => res.status(501).json({ error: 'Gram payment not available yet — use Stars' }));
-app.post('/api/ogpass/buy', authMiddleware, async (req, res) => res.status(501).json({ error: 'Gram payment not available yet — use Stars' }));
+const TON_TREASURY = process.env.TON_TREASURY || 'UQAimXfztHcVa_bipWpbYWRL5eE217KkdwENqZseXVDDlOWQ';
+app.post('/api/ogpass/prepare', authMiddleware, async (req, res) => {
+  const uid = req.tg.user.id;
+  const row = await dbx.get('SELECT og_pass FROM users WHERE telegram_id = ?', [uid]);
+  if (row && row.og_pass) return res.status(400).json({ error: 'OG Pass already active' });
+  const price = Number(await getSetting('og_pass_gram_price', '5')) || 5;
+  const nonce = crypto.randomBytes(6).toString('hex');
+  await dbx.run('INSERT INTO ton_orders (nonce, telegram_id, kind, amount_ton, created_at, status) VALUES (?, ?, ?, ?, ?, ?)', [nonce, uid, 'ogpass', price, Math.floor(Date.now() / 1000), 'pending']);
+  res.json({ ok: true, nonce, price, address: TON_TREASURY });
+});
+// Verifies the on-chain transfer (amount + comment containing the nonce) via toncenter before granting
+app.post('/api/ogpass/buy', authMiddleware, async (req, res) => {
+  const uid = req.tg.user.id;
+  const order = await dbx.get('SELECT * FROM ton_orders WHERE nonce = ? AND telegram_id = ?', [String(req.body.nonce || ''), uid]);
+  if (!order) return res.status(400).json({ error: 'Order not found' });
+  const grantResp = async () => { const u = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [uid]); return res.json({ ok: true, user: userToClient(u) }); };
+  if (order.status === 'paid') return grantResp();
+  const key = process.env.TONCENTER_API_KEY ? '&api_key=' + process.env.TONCENTER_API_KEY : '';
+  const j = await fetch(`https://toncenter.com/api/v2/getTransactions?address=${TON_TREASURY}&limit=40${key}`).then(x => x.json()).catch(() => null);
+  if (!j || !j.ok) return res.status(202).json({ pending: true });
+  const need = Math.floor(Number(order.amount_ton) * 1e9 * 0.99);
+  const tx = (j.result || []).find(t => {
+    const m = t.in_msg || {};
+    let txt = String(m.message || '');
+    try { if (!txt && m.msg_data && m.msg_data.text) txt = Buffer.from(m.msg_data.text, 'base64').toString('utf8'); } catch (_) {}
+    return txt.includes(order.nonce) && Number(m.value) >= need;
+  });
+  if (!tx) return res.status(202).json({ pending: true });
+  const claim = await dbx.run("UPDATE ton_orders SET status = 'paid', tx_hash = ? WHERE nonce = ? AND status = 'pending'", [String(tx.transaction_id && tx.transaction_id.hash || ''), order.nonce]);
+  if (claim.changes) await dbx.run('UPDATE users SET og_pass = 1, updated_at = ? WHERE telegram_id = ?', [Math.floor(Date.now() / 1000), uid]);
+  return grantResp();
+});
 app.post('/api/shop-boosts/claim', authMiddleware, async (req, res) => {
   if (req.body.payment_ok) return res.status(402).json({ error: 'Payment not verified' });
   const b = await dbx.get('SELECT * FROM boosters WHERE id = ? AND active = 1', [req.body.boost_id]);
