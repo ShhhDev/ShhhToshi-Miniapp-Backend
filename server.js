@@ -134,6 +134,9 @@ async function ensureDb() {
   }
   if (!dbx.isPg()) {
     try { await dbx.exec('ALTER TABLE users ADD COLUMN energy_bonus INTEGER'); } catch (_) {}
+    try { await dbx.exec('ALTER TABLE friends ADD COLUMN reward INTEGER DEFAULT 0'); } catch (_) {}
+    try { await dbx.exec('ALTER TABLE users ADD COLUMN og_expires_at INTEGER DEFAULT 0'); } catch (_) {}
+    try { await dbx.exec('ALTER TABLE users ADD COLUMN last_income_at INTEGER DEFAULT 0'); } catch (_) {}
     try { await dbx.exec("ALTER TABLE tasks ADD COLUMN block_id TEXT DEFAULT ''"); } catch (_) {}
   }
   await dbx.exec('CREATE TABLE IF NOT EXISTS ton_orders (nonce TEXT PRIMARY KEY, telegram_id BIGINT, kind TEXT, amount_ton REAL, created_at BIGINT, status TEXT, tx_hash TEXT)');
@@ -411,9 +414,9 @@ async function registerReferral(inviterId, tgUser) {
   const r = await dbx.run('INSERT OR IGNORE INTO referrals (telegram_id, referred_by) VALUES (?, ?)', [tgUser.id, inviterId]);
   if (!r.changes) return false; // already referred -> never double count
   const now = Math.floor(Date.now() / 1000);
-  await dbx.run('INSERT OR IGNORE INTO friends (inviter_id, friend_id, premium, joined_at) VALUES (?, ?, ?, ?)', [inviterId, tgUser.id, tgUser.is_premium ? 1 : 0, now]);
   const rr = await refRewardsFor(inviter.balance);
   const reward = tgUser.is_premium ? rr.premium : rr.normal;
+  await dbx.run('INSERT OR IGNORE INTO friends (inviter_id, friend_id, premium, joined_at, reward) VALUES (?, ?, ?, ?, ?)', [inviterId, tgUser.id, tgUser.is_premium ? 1 : 0, now, reward]);
   await dbx.run('UPDATE users SET friend_earnings = friend_earnings + ?, updated_at = ? WHERE telegram_id = ?', [reward, now, inviterId]);
   const cnt = await dbx.get('SELECT COUNT(*) AS c FROM friends WHERE inviter_id = ?', [inviterId]);
   const name = escHtml(tgUser.first_name || tgUser.username || 'Someone') + (tgUser.username ? ' (@' + escHtml(tgUser.username) + ')' : '');
@@ -511,6 +514,47 @@ function isTestnetAddr(a) {
   return /^[A-Za-z0-9_-]{48}$/.test(a) && !'EU'.includes(a[0]);
 }
 // Max energy = level cap (LEVEL_TABLE.energy) + permanent booster bonus. Follows the player's level up AND down.
+// OG Pass lasts 30 days. Active = flag set AND not expired.
+const OG_DAYS = 30;
+function ogActive(row, now) { return !!row.og_pass && Number(row.og_expires_at) > (now || Math.floor(Date.now() / 1000)); }
+function effPerHour(row, now) { return (Number(row.per_hour) || 0) * (ogActive(row, now) ? 2 : 1); }
+async function normalizeOg(row, now) {
+  if (row.og_pass && !Number(row.og_expires_at)) { // legacy pass without expiry -> 30 days from now
+    row.og_expires_at = now + OG_DAYS * 86400;
+    await dbx.run('UPDATE users SET og_expires_at = ? WHERE telegram_id = ?', [row.og_expires_at, row.telegram_id]);
+  } else if (row.og_pass && Number(row.og_expires_at) <= now) { // expired -> benefits are gone
+    row.og_pass = 0;
+    await dbx.run('UPDATE users SET og_pass = 0 WHERE telegram_id = ?', [row.telegram_id]);
+  }
+}
+async function grantOgPass(uid) {
+  const now = Math.floor(Date.now() / 1000);
+  const row = await dbx.get('SELECT og_pass, og_expires_at FROM users WHERE telegram_id = ?', [uid]);
+  if (!row) return;
+  const base = ogActive(row, now) ? Number(row.og_expires_at) : now;
+  await dbx.run('UPDATE users SET og_pass = 1, og_expires_at = ?, spins = spins + 20, updated_at = ? WHERE telegram_id = ?', [base + OG_DAYS * 86400, now, uid]);
+}
+// Hourly income: credited while online AND offline (offline capped by mining_timer_hrs, default 3h)
+async function accrueIncome(row, now) {
+  const ph = effPerHour(row, now);
+  const prev = Number(row.last_income_at) || 0;
+  const last = prev || Number(row.last_active) || now;
+  if (ph <= 0) { if (!prev) await dbx.run('UPDATE users SET last_income_at = ? WHERE telegram_id = ?', [now, row.telegram_id]); row.last_income_at = now; return 0; }
+  const capSec = Math.max(1, Number(row.mining_timer_hrs) || 3) * 3600;
+  const dt = Math.max(0, Math.min(now - last, capSec));
+  const gain = Math.floor(ph * dt / 3600);
+  if (gain <= 0) return 0; // keep accumulating fractions
+  const r = await dbx.run('UPDATE users SET balance = balance + ?, last_income_at = ? WHERE telegram_id = ? AND COALESCE(last_income_at, 0) = ?', [gain, now, row.telegram_id, prev]);
+  if (!r.changes) return 0; // another request already credited it
+  row.balance = (Number(row.balance) || 0) + gain; row.last_income_at = now;
+  return gain;
+}
+async function takeDailyRefill(uid, row, now) {
+  const cap = ogActive(row, now) ? 2 : 1, day = Math.floor(now / 86400);
+  await dbx.run('INSERT OR IGNORE INTO task_claims (telegram_id, task_id, day, cnt, last_at) VALUES (?, ?, ?, 0, 0)', [uid, '__refill', day]);
+  const r = await dbx.run('UPDATE task_claims SET cnt = cnt + 1, last_at = ? WHERE telegram_id = ? AND task_id = ? AND day = ? AND cnt < ?', [now, uid, '__refill', day, cap]);
+  return r.changes > 0;
+}
 function energyBonusOf(row) { return row.energy_bonus != null ? (Number(row.energy_bonus) || 0) : Math.max(0, (Number(row.max_energy) || 1000) - 1000); }
 function effMaxEnergy(row) { return levelFromBalance(row.balance).energy + energyBonusOf(row); }
 function regenEnergy(row, now) {
@@ -528,7 +572,8 @@ function userToClient(row) {
     levelPct: row.level_pct,
     balance: Math.floor(row.balance || 0),
     perTap: row.per_tap,
-    perHour: row.per_hour,
+    perHour: effPerHour(row),
+    basePerHour: row.per_hour,
     toLvlUp: row.to_lvl_up,
     energy: Math.min(Math.floor(row.energy || 0), effMaxEnergy(row)),
     maxEnergy: effMaxEnergy(row),
@@ -542,7 +587,8 @@ function userToClient(row) {
     isPremium: !!row.is_premium,
     isAdmin: ADMIN_TELEGRAM_IDS.includes(row.telegram_id),
     wallet: row.wallet || '',
-    ogPass: !!row.og_pass,
+    ogPass: ogActive(row),
+    ogPassExpires: ogActive(row) ? new Date(Number(row.og_expires_at) * 1000).toISOString() : null,
     friendEarnings: row.friend_earnings || 0,
     tapExtra: row.tap_extra || 0,
     photo: row.photo_url || '',
@@ -570,17 +616,11 @@ app.post('/api/auth', authMiddleware, async (req, res) => {
   row.energy = regenEnergy(row, now);
   row.max_energy = effMaxEnergy(row);
   await dbx.run('UPDATE users SET energy = ?, max_energy = ?, energy_bonus = ? WHERE telegram_id = ?', [row.energy, row.max_energy, _bonus, row.telegram_id]);
-  const hoursOffline = Math.min((now - lastActive) / 3600, row.mining_timer_hrs || 3);
-  let offlineEarned = 0;
-  if (hoursOffline > 0.05 && row.per_hour > 0) {
-    offlineEarned = Math.floor(hoursOffline * row.per_hour);
-    if (offlineEarned > 0) {
-      await dbx.run('UPDATE users SET balance = balance + ?, last_active = ? WHERE telegram_id = ?', [offlineEarned, now, row.telegram_id]);
-      row.balance += offlineEarned;
-    }
-  } else {
-    await dbx.run('UPDATE users SET last_active = ? WHERE telegram_id = ?', [now, row.telegram_id]);
-  }
+  await normalizeOg(row, now);
+  const gap = now - lastActive;
+  const gained = await accrueIncome(row, now);
+  let offlineEarned = gap > 120 ? gained : 0; // shown in the "while you were offline" popup
+  await dbx.run('UPDATE users SET last_active = ? WHERE telegram_id = ?', [now, row.telegram_id]);
 
   const ownedCards = await dbx.all('SELECT card_id, level FROM user_cards WHERE telegram_id = ?', [row.telegram_id]);
   const ownedBoosters = await dbx.all('SELECT booster_id, level FROM user_boosters WHERE telegram_id = ?', [row.telegram_id]);
@@ -588,13 +628,14 @@ app.post('/api/auth', authMiddleware, async (req, res) => {
   const doneTasks = (doneTasksRows || []).map(t => t.task_id);
 
   const friends = await dbx.all(`
-    SELECT f.friend_id, u.handle, u.username, u.first_name, f.premium, f.joined_at
+    SELECT f.friend_id, u.handle, u.username, u.first_name, f.premium, f.joined_at, f.reward, u.og_pass, u.og_expires_at
     FROM friends f LEFT JOIN users u ON u.telegram_id = f.friend_id
     WHERE f.inviter_id = ? ORDER BY f.joined_at DESC LIMIT 50
   `, [row.telegram_id]);
 
   const leaderboard = await dbx.all(`
     SELECT telegram_id, first_name, username, handle, balance as total, balance, per_hour as hourly,
+      CASE WHEN og_pass = 1 AND og_expires_at > ${Math.floor(Date.now() / 1000)} THEN 1 ELSE 0 END AS og,
       (SELECT COUNT(*) FROM friends WHERE inviter_id = users.telegram_id) as friends
     FROM users ORDER BY balance DESC LIMIT 50
   `, []);
@@ -623,6 +664,8 @@ app.post('/api/auth', authMiddleware, async (req, res) => {
       id: f.friend_id,
       name: (f.first_name || f.handle || f.username || ('User ' + f.friend_id)).toString().replace(/^@/, ''),
       premium: !!f.premium,
+      reward: Number(f.reward) || 0,
+      og: ogActive(f),
       joined: new Date(f.joined_at * 1000).toLocaleDateString()
     })),
     season1Friends: '-',
@@ -634,7 +677,8 @@ app.post('/api/auth', authMiddleware, async (req, res) => {
       score: Math.floor(Number(p.total != null ? p.total : p.balance) || 0),
       total: Math.floor(Number(p.total != null ? p.total : p.balance) || 0),
       balance: Math.floor(Number(p.total != null ? p.total : p.balance) || 0),
-      hourly: Number(p.hourly) || 0,
+      hourly: (Number(p.hourly) || 0) * (Number(p.og) ? 2 : 1),
+      og: !!Number(p.og),
       friends: Number(p.friends) || 0,
       rank: i + 1,
       isYou: Number(p.telegram_id) === Number(row.telegram_id)
@@ -650,8 +694,10 @@ app.post('/api/tap', authMiddleware, async (req, res) => {
   if (!row) return res.status(404).json({ error: 'User not found' });
 
   const nowT = Math.floor(Date.now() / 1000);
+  await normalizeOg(row, nowT);
+  await accrueIncome(row, nowT);
   const lv = levelFromBalance(row.balance);
-  const perTap = Math.max(Number(row.per_tap) || 1, lv.baseTap);
+  const perTap = Math.max(Number(row.per_tap) || 1, lv.baseTap) + (ogActive(row, nowT) ? 2 : 0);
   const gain = perTap * taps;
   const curEnergy = regenEnergy(row, nowT);
   if (curEnergy < taps) return res.status(400).json({ error: 'Not enough energy', energy: Math.floor(curEnergy) });
@@ -734,7 +780,10 @@ app.post('/api/shop/booster', authMiddleware, async (req, res) => {
   if (booster.effect_type === 'energy_limit') newBonus += (booster.effect_value || 500);
   if (booster.effect_type === 'mining_timer') newMining += (booster.effect_value || 1);
   newMaxEnergy = levelFromBalance((Number(row.balance) || 0) - cost).energy + newBonus;
-  if (booster.effect_type === 'full_energy') newEnergy = newMaxEnergy;
+  if (booster.effect_type === 'full_energy') {
+    if (!(await takeDailyRefill(user.id, row, Math.floor(Date.now() / 1000)))) return res.status(400).json({ error: 'Daily refill used — come back tomorrow' });
+    newEnergy = newMaxEnergy;
+  }
 
   await dbx.run(`
     UPDATE users SET balance = balance - ?, per_tap = ?, max_energy = ?, energy_bonus = ?,
@@ -776,9 +825,11 @@ async function completeTask(req, res) {
       ON CONFLICT(telegram_id, task_id) DO UPDATE SET done = 1 WHERE user_tasks.done = 0`, [user.id, task.id]);
     if (!claim.changes) return res.status(400).json({ error: 'Already completed' });
   }
-  await dbx.run('UPDATE users SET balance = balance + ?, updated_at = ? WHERE telegram_id = ?', [task.reward, now, user.id]);
+  const urow = await dbx.get('SELECT og_pass, og_expires_at FROM users WHERE telegram_id = ?', [user.id]);
+  const payout = Math.round(task.reward * (urow && ogActive(urow, now) ? 1.1 : 1));
+  await dbx.run('UPDATE users SET balance = balance + ?, updated_at = ? WHERE telegram_id = ?', [payout, now, user.id]);
   const full = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [user.id]);
-  res.json({ reward: task.reward, balance: Math.floor(full.balance), repeatable: task.section === 'watch', user: userToClient(full) });
+  res.json({ reward: payout, balance: Math.floor(full.balance), repeatable: task.section === 'watch', user: userToClient(full) });
 }
 app.post('/api/tasks/complete', authMiddleware, completeTask);
 app.post('/api/task/complete', authMiddleware, completeTask);
@@ -790,24 +841,48 @@ app.post('/api/spin', authMiddleware, async (req, res) => {
   if (!row) return res.status(404).json({ error: 'User not found' });
   if ((Number(row.spins) || 0) <= 0) return res.status(400).json({ error: 'No spins left', spins: 0 });
 
-  const prizes = [500, 1000, 2500, 5000, 10000, 25000];
-  const win = prizes[Math.floor(Math.random() * prizes.length)];
+  const TABLE = [['miss', 24], ['coin', 26], ['battery', 10], ['hand', 5], ['watch', 9], ['bolt', 14], ['wheel', 12]];
+  let roll = Math.random() * TABLE.reduce((s, x) => s + x[1], 0), seg = 'miss';
+  for (const [id, w] of TABLE) { if ((roll -= w) < 0) { seg = id; break; } }
+  const now = Math.floor(Date.now() / 1000);
+  const sets = ['spins = spins - 1 + ?', 'updated_at = ?'], par = [seg === 'wheel' ? 2 : 0, now];
+  let amount = 0, message = 'No luck this time';
+  if (seg === 'coin') {
+    const P = [[500, 40], [1000, 30], [2500, 18], [5000, 9], [10000, 3]];
+    let r2 = Math.random() * 100; amount = 500;
+    for (const [v, w] of P) { if ((r2 -= w) < 0) { amount = v; break; } }
+    sets.push('balance = balance + ?'); par.push(amount); message = 'You won ' + amount.toLocaleString('en-US') + ' $SHHHT';
+  } else if (seg === 'battery') {
+    const nb = energyBonusOf(row) + 100;
+    sets.push('energy_bonus = ?', 'max_energy = ?'); par.push(nb, effMaxEnergy({ balance: row.balance, energy_bonus: nb, max_energy: row.max_energy }));
+    message = '+100 max energy';
+  } else if (seg === 'hand') { sets.push('per_tap = per_tap + 1'); message = '+1 per tap'; }
+  else if (seg === 'watch') { sets.push('mining_timer_hrs = CASE WHEN mining_timer_hrs < 12 THEN mining_timer_hrs + 1 ELSE mining_timer_hrs END'); message = '+1 hour offline mining'; }
+  else if (seg === 'bolt') { sets.push('energy = max_energy'); message = 'Energy fully refilled'; }
+  else if (seg === 'wheel') message = '+2 free spins';
 
-  const sp = await dbx.run('UPDATE users SET spins = spins - 1, balance = balance + ?, updated_at = ? WHERE telegram_id = ? AND spins > 0', [win, Math.floor(Date.now() / 1000), user.id]);
+  const sp = await dbx.run(`UPDATE users SET ${sets.join(', ')} WHERE telegram_id = ? AND spins > 0`, [...par, user.id]);
   if (!sp.changes) return res.status(400).json({ error: 'No spins left', spins: 0 });
 
-  const updated = await dbx.get('SELECT balance, spins FROM users WHERE telegram_id = ?', [user.id]);
-  res.json({ win, balance: Math.floor(updated.balance), spins: updated.spins });
+  const updated = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [user.id]);
+  res.json({ segment: seg, amount, win: amount, message, balance: Math.floor(updated.balance), spins: updated.spins, user: userToClient(updated) });
 });
 
 app.get('/api/user/me', authMiddleware, async (req, res) => {
   const row = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [req.tg.user.id]);
   if (!row) return res.status(404).json({ error: 'Not found' });
+  const nowM = Math.floor(Date.now() / 1000);
+  await normalizeOg(row, nowM);
+  await accrueIncome(row, nowM);
   res.json({ user: userToClient(row), player: userToClient(row) });
 });
 
 app.get('/api/config', authMiddleware, async (req, res) => {
-  res.json(await loadGameConfig());
+  const config = await loadGameConfig();
+  const rows = await dbx.all('SELECT task_id FROM user_tasks WHERE telegram_id = ? AND done = 1', [req.tg.user.id]);
+  const done = (rows || []).map(r => r.task_id);
+  config.tasks = config.tasks.map(t => { const rep = t.section === 'watch'; return { ...t, blockId: t.block_id || '', repeatable: rep, done: rep ? false : done.includes(t.id) }; });
+  res.json(config);
 });
 
 app.get('/api/me', authMiddleware, async (req, res) => {
@@ -1022,7 +1097,7 @@ app.post('/api/withdrawals', authMiddleware, async (req, res) => {
   if (!row) return res.status(404).json({ error: 'User not found' });
   if (row.balance < amount) return res.status(400).json({ error: 'Insufficient balance' });
 
-  const isOg = !!row.og_pass; // never trust client-sent isOg
+  const isOg = ogActive(row); // never trust client-sent isOg
   const feePct = Number(await getSetting('withdrawal_fee_pct', '5')) || 5;
   const fee = Math.floor(amount * feePct / 100);
   const receive = amount - fee;
@@ -1241,7 +1316,7 @@ app.delete('/api/admin/spin-packages/:id', authMiddleware, adminMiddleware, asyn
 
 app.get('/api/leaderboard', authMiddleware, async (req, res) => {
   const rows = await dbx.all(
-    "SELECT telegram_id, first_name, username, handle, balance, per_hour as hourly, (SELECT COUNT(*) FROM friends WHERE inviter_id = users.telegram_id) as friends FROM users ORDER BY balance DESC LIMIT 50",
+    "SELECT telegram_id, first_name, username, handle, balance, per_hour as hourly, CASE WHEN og_pass = 1 AND og_expires_at > " + Math.floor(Date.now() / 1000) + " THEN 1 ELSE 0 END AS og, (SELECT COUNT(*) FROM friends WHERE inviter_id = users.telegram_id) as friends FROM users ORDER BY balance DESC LIMIT 50",
     []
   );
   const mapped = (rows || []).map(p => ({
@@ -1251,7 +1326,8 @@ app.get('/api/leaderboard', authMiddleware, async (req, res) => {
     balance: Math.floor(p.balance || 0),
     total: Math.floor(p.balance || 0),
     score: Math.floor(p.balance || 0),
-    hourly: p.hourly || 0,
+    hourly: (p.hourly || 0) * (Number(p.og) ? 2 : 1),
+    og: !!Number(p.og),
     friends: p.friends || 0
   }));
   res.json({ users: mapped, leaderboard: mapped });
@@ -1452,7 +1528,7 @@ app.post('/api/internal/payment', async (req, res) => {
   if (seen) return res.json({ ok: true, duplicate: true });
   await dbx.run('INSERT INTO settings (key, value) VALUES (?, ?)', ['paid_' + charge_id, '1']);
   const now = Math.floor(Date.now() / 1000), uid = Number(p.uid);
-  if (p.kind === 'ogpass') await dbx.run('UPDATE users SET og_pass = 1, updated_at = ? WHERE telegram_id = ?', [now, uid]);
+  if (p.kind === 'ogpass') await grantOgPass(uid);
   else if (p.kind === 'spinpack') {
     const pk = (await getSpinPackages()).find(x => x.id === p.packId);
     if (pk) await dbx.run('UPDATE users SET spins = spins + ?, updated_at = ? WHERE telegram_id = ?', [Number(pk.spins) || 0, now, uid]);
@@ -1591,8 +1667,8 @@ app.post('/api/task/verify-telegram', authMiddleware, async (req, res) => {
 const TON_TREASURY = process.env.TON_TREASURY || 'UQAimXfztHcVa_bipWpbYWRL5eE217KkdwENqZseXVDDlOWQ';
 app.post('/api/ogpass/prepare', authMiddleware, async (req, res) => {
   const uid = req.tg.user.id;
-  const row = await dbx.get('SELECT og_pass FROM users WHERE telegram_id = ?', [uid]);
-  if (row && row.og_pass) return res.status(400).json({ error: 'OG Pass already active' });
+  const row = await dbx.get('SELECT og_pass, og_expires_at FROM users WHERE telegram_id = ?', [uid]);
+  if (row && ogActive(row)) return res.status(400).json({ error: 'OG Pass already active' });
   const price = Number(await getSetting('og_pass_gram_price', '5')) || 5;
   const nonce = crypto.randomBytes(6).toString('hex');
   await dbx.run('INSERT INTO ton_orders (nonce, telegram_id, kind, amount_ton, created_at, status) VALUES (?, ?, ?, ?, ?, ?)', [nonce, uid, 'ogpass', price, Math.floor(Date.now() / 1000), 'pending']);
@@ -1617,7 +1693,7 @@ app.post('/api/ogpass/buy', authMiddleware, async (req, res) => {
   });
   if (!tx) return res.status(202).json({ pending: true });
   const claim = await dbx.run("UPDATE ton_orders SET status = 'paid', tx_hash = ? WHERE nonce = ? AND status = 'pending'", [String(tx.transaction_id && tx.transaction_id.hash || ''), order.nonce]);
-  if (claim.changes) await dbx.run('UPDATE users SET og_pass = 1, updated_at = ? WHERE telegram_id = ?', [Math.floor(Date.now() / 1000), uid]);
+  if (claim.changes) await grantOgPass(uid);
   return grantResp();
 });
 app.post('/api/shop-boosts/claim', authMiddleware, async (req, res) => {
@@ -1630,6 +1706,7 @@ app.post('/api/shop-boosts/claim', authMiddleware, async (req, res) => {
   const isEn = b.effect_type === 'energy_limit';
   const sets = isEn ? 'max_energy = max_energy + ?, energy_bonus = COALESCE(energy_bonus, max_energy - 1000) + ?' : (col ? `${col} = ${col} + ?` : (b.effect_type === 'full_energy' ? 'energy = max_energy' : null));
   if (!sets) return res.status(400).json({ error: 'Booster not available' });
+  if (b.effect_type === 'full_energy' && !(await takeDailyRefill(uid, row, now))) return res.status(400).json({ error: 'Daily refill used — come back tomorrow' });
   const r = await dbx.run(`UPDATE users SET balance = balance - ?, ${sets}, updated_at = ? WHERE telegram_id = ? AND balance >= ?`,
     isEn ? [cost, v, v, now, uid, cost] : (col ? [cost, v, now, uid, cost] : [cost, now, uid, cost]));
   if (!r.changes) return res.status(400).json({ error: 'Not enough balance' });
