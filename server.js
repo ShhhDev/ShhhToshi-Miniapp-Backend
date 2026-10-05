@@ -143,6 +143,7 @@ async function ensureDb() {
     try { await dbx.exec('ALTER TABLE users ADD COLUMN last_income_at INTEGER DEFAULT 0'); } catch (_) {}
     try { await dbx.exec("ALTER TABLE tasks ADD COLUMN block_id TEXT DEFAULT ''"); } catch (_) {}
   }
+  try { await dbx.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_wallet_uq ON users(wallet) WHERE wallet IS NOT NULL AND wallet <> ''"); } catch (e) { console.warn('wallet unique index skipped (duplicates exist):', e.message); }
   await dbx.exec('CREATE TABLE IF NOT EXISTS ton_orders (nonce TEXT PRIMARY KEY, telegram_id BIGINT, kind TEXT, amount_ton REAL, created_at BIGINT, status TEXT, tx_hash TEXT)');
   await dbx.exec('CREATE TABLE IF NOT EXISTS task_claims (telegram_id BIGINT, task_id TEXT, day INTEGER, cnt INTEGER DEFAULT 0, last_at BIGINT DEFAULT 0, PRIMARY KEY (telegram_id, task_id, day))');
   dbReady = true;
@@ -245,11 +246,20 @@ async function getTiers() {
 async function getReferralTiers() {
   return await dbx.all('SELECT * FROM referral_tiers WHERE active = 1 ORDER BY sort_order, id', []);
 }
+const SETTINGS_CACHE = { t: 0, map: null };
+const CONFIG_CACHE = { t: 0, v: null };
+function bustCaches() { SETTINGS_CACHE.t = 0; CONFIG_CACHE.t = 0; LB_CACHE.t = 0; }
+const LB_CACHE = { t: 0, v: null };
 async function getSetting(key, fallback = null) {
-  const row = await dbx.get('SELECT value FROM settings WHERE key = ?', [key]);
-  return row ? row.value : fallback;
+  if (!SETTINGS_CACHE.map || Date.now() - SETTINGS_CACHE.t > 20000) {
+    const rows = await dbx.all('SELECT key, value FROM settings', []);
+    const m = new Map(); for (const r of rows || []) m.set(r.key, r.value);
+    SETTINGS_CACHE.map = m; SETTINGS_CACHE.t = Date.now();
+  }
+  return SETTINGS_CACHE.map.has(key) ? SETTINGS_CACHE.map.get(key) : fallback;
 }
 async function setSetting(key, value) {
+  bustCaches();
   const v = typeof value === 'string' ? value : JSON.stringify(value);
   const exists = await dbx.get('SELECT key FROM settings WHERE key = ?', [key]);
   if (exists) {
@@ -260,6 +270,12 @@ async function setSetting(key, value) {
 }
 
 async function loadGameConfig() {
+  if (CONFIG_CACHE.v && Date.now() - CONFIG_CACHE.t < 20000) return { ...CONFIG_CACHE.v };
+  const cfg = await loadGameConfigRaw();
+  CONFIG_CACHE.v = cfg; CONFIG_CACHE.t = Date.now();
+  return { ...cfg };
+}
+async function loadGameConfigRaw() {
   let dailyRewards = [2500, 5000, 7500, 10000, 15000, 20000, 30000];
   try {
     const raw = await getSetting('daily_rewards', '[]');
@@ -470,13 +486,13 @@ async function getOrCreateUser(tgUser, startParam = null) {
 
 const LEVEL_TABLE = [
   { name: "Rookie",   min: 0,        baseTap: 1, energy: 1000 },
-  { name: "Bronze",   min: 10000,    baseTap: 2, energy: 1500 },
-  { name: "Silver",   min: 50000,    baseTap: 3, energy: 2000 },
-  { name: "Gold",     min: 150000,   baseTap: 4, energy: 2500 },
-  { name: "Platinum", min: 400000,   baseTap: 5, energy: 3000 },
-  { name: "Diamond",  min: 1000000,  baseTap: 6, energy: 3500 },
-  { name: "Master",   min: 2500000,  baseTap: 7, energy: 4000 },
-  { name: "Legend",   min: 5000000,  baseTap: 8, energy: 5000 }
+  { name: "Bronze",   min: 100000,   baseTap: 2, energy: 1500 },
+  { name: "Silver",   min: 500000,   baseTap: 3, energy: 2000 },
+  { name: "Gold",     min: 1500000,  baseTap: 4, energy: 2500 },
+  { name: "Platinum", min: 4000000,  baseTap: 5, energy: 3000 },
+  { name: "Diamond",  min: 10000000, baseTap: 6, energy: 3500 },
+  { name: "Master",   min: 25000000, baseTap: 7, energy: 4000 },
+  { name: "Legend",   min: 50000000, baseTap: 8, energy: 5000 }
 ];
 // Referral reward scales with the inviter's level: base x (1 + step x levelIndex)
 let REF_CFG = { base: 1000, step: 0, at: 0 };
@@ -548,6 +564,7 @@ function toFriendlyAddr(a, tag) {
   const crc = crc16x(body);
   return Buffer.concat([body, Buffer.from([crc >> 8, crc & 255])]).toString('base64').replace(/\+/g, '-').replace(/\//g, '_');
 }
+app.use('/api/admin', (req, res, next) => { if (req.method !== 'GET') bustCaches(); next(); });
 // Banned users are blocked everywhere (short cache so admin changes apply within seconds)
 const BAN_CACHE = new Map();
 async function isBanned(uid) {
@@ -599,6 +616,22 @@ async function takeDailyRefill(uid, row, now) {
 }
 function energyBonusOf(row) { return row.energy_bonus != null ? (Number(row.energy_bonus) || 0) : Math.max(0, (Number(row.max_energy) || 1000) - 1000); }
 function effMaxEnergy(row) { return levelFromBalance(row.balance).energy + energyBonusOf(row); }
+function addrForms(a) {
+  a = String(a || '').trim();
+  let raw = a;
+  const m = a.match(/^(-?\d+):([0-9a-fA-F]{64})$/);
+  if (!m && /^[A-Za-z0-9_-]{48}$/.test(a)) {
+    const buf = Buffer.from(a.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+    if (buf.length === 36) { const wc = buf[1] > 127 ? buf[1] - 256 : buf[1]; raw = wc + ':' + buf.slice(2, 34).toString('hex'); }
+  }
+  const ok = /^(-?\d+):([0-9a-fA-F]{64})$/.test(raw);
+  return ok ? { uq: toFriendlyAddr(raw, 0x51), eq: toFriendlyAddr(raw, 0x11), raw: raw.toLowerCase() } : { uq: a, eq: a, raw: a };
+}
+async function walletTaken(uid, addr) {
+  const f = addrForms(addr);
+  const r = await dbx.get('SELECT telegram_id FROM users WHERE wallet IN (?, ?, ?, ?) AND telegram_id <> ? LIMIT 1', [f.uq, f.eq, f.raw, String(addr).trim(), uid]);
+  return !!r;
+}
 function regenEnergy(row, now) {
   const dt = Math.max(0, now - (Number(row.last_active) || now));
   return Math.min(effMaxEnergy(row), (Number(row.energy) || 0) + dt);
@@ -648,8 +681,7 @@ function userToClient(row) {
 app.post('/api/auth', authMiddleware, async (req, res) => {
   const { user, startParam } = req.tg;
   console.log('[auth] ok user', user.id);
-  const row = await getOrCreateUser(user, startParam);
-  const config = await loadGameConfig();
+  const [row, config] = await Promise.all([getOrCreateUser(user, startParam), loadGameConfig()]);
 
   // Offline earnings
   const now = Math.floor(Date.now() / 1000);
@@ -671,23 +703,23 @@ app.post('/api/auth', authMiddleware, async (req, res) => {
   let offlineEarned = gap > 120 ? gained : 0; // shown in the "while you were offline" popup
   await dbx.run('UPDATE users SET last_active = ?, last_seen_at = ? WHERE telegram_id = ?', [now, now, row.telegram_id]);
 
-  const ownedCards = await dbx.all('SELECT card_id, level FROM user_cards WHERE telegram_id = ?', [row.telegram_id]);
-  const ownedBoosters = await dbx.all('SELECT booster_id, level FROM user_boosters WHERE telegram_id = ?', [row.telegram_id]);
-  const doneTasksRows = await dbx.all('SELECT task_id FROM user_tasks WHERE telegram_id = ? AND done = 1', [row.telegram_id]);
-  const doneTasks = (doneTasksRows || []).map(t => t.task_id);
-
-  const friends = await dbx.all(`
-    SELECT f.friend_id, u.handle, u.username, u.first_name, f.premium, f.joined_at, f.reward, u.og_pass, u.og_expires_at
-    FROM friends f LEFT JOIN users u ON u.telegram_id = f.friend_id
-    WHERE f.inviter_id = ? ORDER BY f.joined_at DESC LIMIT 50
-  `, [row.telegram_id]);
-
-  const leaderboard = await dbx.all(`
+  const nowLb = Math.floor(Date.now() / 1000);
+  const lbPromise = (LB_CACHE.v && Date.now() - LB_CACHE.t < 10000) ? Promise.resolve(LB_CACHE.v) : dbx.all(`
     SELECT telegram_id, first_name, username, handle, balance as total, balance, per_hour as hourly,
-      CASE WHEN og_pass = 1 AND og_expires_at > ${Math.floor(Date.now() / 1000)} THEN 1 ELSE 0 END AS og,
+      CASE WHEN og_pass = 1 AND og_expires_at > ${nowLb} THEN 1 ELSE 0 END AS og,
       (SELECT COUNT(*) FROM friends WHERE inviter_id = users.telegram_id) as friends
     FROM users ORDER BY balance DESC LIMIT 50
-  `, []);
+  `, []).then(v => { LB_CACHE.v = v; LB_CACHE.t = Date.now(); return v; });
+  const [ownedCards, ownedBoosters, doneTasksRows, friends, leaderboard] = await Promise.all([
+    dbx.all('SELECT card_id, level FROM user_cards WHERE telegram_id = ?', [row.telegram_id]),
+    dbx.all('SELECT booster_id, level FROM user_boosters WHERE telegram_id = ?', [row.telegram_id]),
+    dbx.all('SELECT task_id FROM user_tasks WHERE telegram_id = ? AND done = 1', [row.telegram_id]),
+    dbx.all(`SELECT f.friend_id, u.handle, u.username, u.first_name, f.premium, f.joined_at, f.reward, u.og_pass, u.og_expires_at
+      FROM friends f LEFT JOIN users u ON u.telegram_id = f.friend_id
+      WHERE f.inviter_id = ? ORDER BY f.joined_at DESC LIMIT 50`, [row.telegram_id]),
+    lbPromise
+  ]);
+  const doneTasks = (doneTasksRows || []).map(t => String(t.task_id));
 
   // Attach per-user booster levels
   const boostersWithLevel = config.boosters.map(b => {
@@ -706,7 +738,7 @@ app.post('/api/auth', authMiddleware, async (req, res) => {
     freeSpin,
     config: {
       ...config,
-      tasks: config.tasks.map(t => { const rep = t.section === 'watch'; return { ...t, tg: isTgTask(t), blockId: t.block_id || '', repeatable: rep, done: rep ? false : doneTasks.includes(t.id) }; }),
+      tasks: config.tasks.map(t => { const rep = t.section === 'watch'; return { ...t, tg: isTgTask(t), blockId: t.block_id || '', repeatable: rep, done: rep ? false : doneTasks.includes(String(t.id)) }; }),
       boosters: boostersWithLevel,
       cards: cardsForUser(config.cards, ownedCards),
       shopBoosts: shopBoostsForUser(config.shopBoosts, ownedBoosters, config.boosters)
@@ -959,11 +991,13 @@ app.get('/api/user/me', authMiddleware, async (req, res) => {
 
 app.get('/api/config', authMiddleware, async (req, res) => {
   const config = await loadGameConfig();
-  const rows = await dbx.all('SELECT task_id FROM user_tasks WHERE telegram_id = ? AND done = 1', [req.tg.user.id]);
-  const done = (rows || []).map(r => r.task_id);
-  config.tasks = config.tasks.map(t => { const rep = t.section === 'watch'; return { ...t, tg: isTgTask(t), blockId: t.block_id || '', repeatable: rep, done: rep ? false : done.includes(t.id) }; });
-  const oc = await dbx.all('SELECT card_id, level FROM user_cards WHERE telegram_id = ?', [req.tg.user.id]);
-  const ob = await dbx.all('SELECT booster_id, level FROM user_boosters WHERE telegram_id = ?', [req.tg.user.id]);
+  const [rows, oc, ob] = await Promise.all([
+    dbx.all('SELECT task_id FROM user_tasks WHERE telegram_id = ? AND done = 1', [req.tg.user.id]),
+    dbx.all('SELECT card_id, level FROM user_cards WHERE telegram_id = ?', [req.tg.user.id]),
+    dbx.all('SELECT booster_id, level FROM user_boosters WHERE telegram_id = ?', [req.tg.user.id])
+  ]);
+  const done = (rows || []).map(r => String(r.task_id));
+  config.tasks = config.tasks.map(t => { const rep = t.section === 'watch'; return { ...t, tg: isTgTask(t), blockId: t.block_id || '', repeatable: rep, done: rep ? false : done.includes(String(t.id)) }; });
   config.cards = cardsForUser(config.cards, oc);
   config.shopBoosts = shopBoostsForUser(config.shopBoosts, ob, config.boosters);
   res.json(config);
@@ -1260,7 +1294,8 @@ app.post('/api/wallet', authMiddleware, async (req, res) => {
   const wallet = String(req.body?.wallet || '').trim();
   if (!wallet) return res.status(400).json({ error: 'wallet required' });
   if (isTestnetAddr(wallet)) return res.status(400).json({ error: 'Testnet wallets are not allowed. Use a Mainnet wallet.' });
-  await dbx.run('UPDATE users SET wallet = ?, updated_at = ? WHERE telegram_id = ?', [toFriendlyAddr(wallet), Math.floor(Date.now() / 1000), req.tg.user.id]);
+  if (await walletTaken(req.tg.user.id, wallet)) return res.status(409).json({ error: 'This wallet is already connected to another account' });
+  await dbx.run('UPDATE users SET wallet = ?, updated_at = ? WHERE telegram_id = ?', [addrForms(wallet).uq, Math.floor(Date.now() / 1000), req.tg.user.id]);
   res.json({ ok: true, wallet: toFriendlyAddr(wallet) });
 });
 
@@ -1276,7 +1311,7 @@ app.post('/api/user/sync', authMiddleware, async (req, res) => {
   const row = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [id]);
   if (!row) return res.status(404).json({ error: 'Not found' });
   // SECURITY: balance/spins are server-authoritative; only wallet is accepted from the client
-  if (wallet && !isTestnetAddr(wallet)) await dbx.run('UPDATE users SET wallet=?, last_active=?, updated_at=? WHERE telegram_id=?', [toFriendlyAddr(String(wallet)).slice(0, 128), now, now, id]);
+  if (wallet && !isTestnetAddr(wallet) && !(await walletTaken(id, wallet))) await dbx.run('UPDATE users SET wallet=?, last_active=?, updated_at=? WHERE telegram_id=?', [toFriendlyAddr(String(wallet)).slice(0, 128), now, now, id]);
   const updated = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [id]);
   res.json({ ok: true, player: userToClient(updated), user: userToClient(updated) });
 });
@@ -1611,9 +1646,10 @@ app.post('/api/user/wallet', authMiddleware, async (req, res) => {
   const addr = String(req.body.wallet_address || req.body.wallet || '').trim();
   if (!addr) return res.status(400).json({ error: 'wallet required' });
   if (isTestnetAddr(addr)) return res.status(400).json({ error: 'Testnet wallets are not allowed. Use a Mainnet wallet.' });
+  if (await walletTaken(req.tg.user.id, addr)) return res.status(409).json({ error: 'This wallet is already connected to another account' });
   await dbx.run('UPDATE users SET wallet = ?, updated_at = ? WHERE telegram_id = ?',
-    [toFriendlyAddr(addr), Math.floor(Date.now() / 1000), req.tg.user.id]);
-  res.json({ ok: true, wallet: addr });
+    [addrForms(addr).uq, Math.floor(Date.now() / 1000), req.tg.user.id]);
+  res.json({ ok: true, wallet: addrForms(addr).uq });
 });
 
 

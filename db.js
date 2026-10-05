@@ -35,6 +35,9 @@ async function init() {
       connectionString: DATABASE_URL,
       ssl: process.env.PG_SSL === 'false' ? false : { rejectUnauthorized: false },
       max: 10,
+      keepAlive: true,
+      idleTimeoutMillis: 60000,
+      connectionTimeoutMillis: 8000,
     });
     // quick ping
     await pool.query('SELECT 1');
