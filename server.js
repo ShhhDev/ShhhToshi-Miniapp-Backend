@@ -136,6 +136,8 @@ async function ensureDb() {
     try { await dbx.exec('ALTER TABLE users ADD COLUMN energy_bonus INTEGER'); } catch (_) {}
     try { await dbx.exec('ALTER TABLE friends ADD COLUMN reward INTEGER DEFAULT 0'); } catch (_) {}
     try { await dbx.exec('ALTER TABLE users ADD COLUMN og_expires_at INTEGER DEFAULT 0'); } catch (_) {}
+    try { await dbx.exec('ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0'); } catch (_) {}
+    try { await dbx.exec('ALTER TABLE users ADD COLUMN free_spin_day INTEGER DEFAULT 0'); } catch (_) {}
     try { await dbx.exec('ALTER TABLE users ADD COLUMN last_income_at INTEGER DEFAULT 0'); } catch (_) {}
     try { await dbx.exec("ALTER TABLE tasks ADD COLUMN block_id TEXT DEFAULT ''"); } catch (_) {}
   }
@@ -263,6 +265,7 @@ async function loadGameConfig() {
     if (Array.isArray(parsed) && parsed.length) dailyRewards = parsed;
   } catch (_) {}
   const tasks = await getTasks();
+  while (dailyRewards.length < 30) dailyRewards.push(Math.floor(dailyRewards[dailyRewards.length - 1] * 1.12));
   const cards = await getCards();
   const boosters = await getBoosters();
   const tiers = await getTiers();
@@ -377,7 +380,7 @@ function authMiddleware(req, res, next) {
     return res.status(401).json({ error: 'Invalid or expired Telegram auth. Open the Mini App inside Telegram.' });
   }
   req.tg = validated;
-  next();
+  isBanned(validated.user.id).then(v => { if (v) return res.status(403).json({ error: 'Account suspended' }); next(); }).catch(() => next());
 }
 
 function adminMiddleware(req, res, next) {
@@ -516,6 +519,43 @@ function isTestnetAddr(a) {
 // Max energy = level cap (LEVEL_TABLE.energy) + permanent booster bonus. Follows the player's level up AND down.
 // OG Pass lasts 30 days. Active = flag set AND not expired.
 const OG_DAYS = 30;
+// Per tap = level total (Rookie 1, Bronze 1+2=3, Silver 3+3=6 ...) + booster extras + OG(+2)
+function levelTapTotal(balance) { const i = Math.max(0, LEVEL_TABLE.indexOf(levelFromBalance(balance))); return (i + 1) * (i + 2) / 2; }
+function tapExtraOf(row) { return Math.max(0, (Number(row.per_tap) || 1) - 1) + (Number(row.tap_extra) || 0); }
+function effPerTap(row, now) { return levelTapTotal(row.balance) + tapExtraOf(row) + (ogActive(row, now) ? 2 : 0); }
+// Income cards: owned level L (0..8). Upgrade cost = base x 2^L; the upgrade L->L+1 adds base_ph x 1.5^L per hour
+const CARD_MAX = 8;
+function cardIncome(c, n) { let t = 0; for (let k = 0; k < n; k++) t += Math.round((Number(c.per_hour) || 0) * Math.pow(1.5, k)); return t; } // each upgrade adds base x 1.5^level
+function cardView(c, L) {
+  return { level: L, maxed: L >= CARD_MAX, nextCost: Math.round((Number(c.cost) || 0) * Math.pow(2, L)), gain: cardIncome(c, L + 1) - cardIncome(c, L), curPerHour: cardIncome(c, L) };
+}
+function cardsForUser(cards, owned) {
+  return (cards || []).map(c => { const o = (owned || []).find(x => x.card_id === c.id); const L = Math.min(CARD_MAX, o ? Number(o.level) || 0 : 0); return { ...c, ...cardView({ per_hour: c.perHour, cost: c.cost }, L) }; });
+}
+function shopBoostsForUser(list, owned, raw) {
+  return (list || []).map(s => { const o = (owned || []).find(x => x.booster_id === s.id); const L = o ? Number(o.level) || 0 : 0; const r = (raw || []).find(x => x.id === s.id) || {}; return { ...s, level: L, cost: boosterPrice({ base_cost: s.spPrice, effect_type: r.effectType || '' }, L) }; });
+}
+function boosterPrice(b, L) { return b.effect_type === 'full_energy' ? (Number(b.base_cost) || 0) : Math.round((Number(b.base_cost) || 0) * Math.pow(2, L)); }
+// Raw TON address (0:hex) -> friendly UQ.. (non-bounceable, mainnet)
+function crc16x(buf) { let c = 0; for (const x of buf) { c ^= x << 8; for (let i = 0; i < 8; i++) c = (c & 0x8000) ? ((c << 1) ^ 0x1021) & 0xFFFF : (c << 1) & 0xFFFF; } return c; }
+function toFriendlyAddr(a, tag) {
+  a = String(a || '').trim();
+  const m = a.match(/^(-?\d+):([0-9a-fA-F]{64})$/);
+  if (!m) return a;
+  const body = Buffer.concat([Buffer.from([tag || 0x51, parseInt(m[1], 10) & 0xff]), Buffer.from(m[2], 'hex')]);
+  const crc = crc16x(body);
+  return Buffer.concat([body, Buffer.from([crc >> 8, crc & 255])]).toString('base64').replace(/\+/g, '-').replace(/\//g, '_');
+}
+// Banned users are blocked everywhere (short cache so admin changes apply within seconds)
+const BAN_CACHE = new Map();
+async function isBanned(uid) {
+  const c = BAN_CACHE.get(uid);
+  if (c && Date.now() - c.t < 15000) return c.v;
+  const r = await dbx.get('SELECT banned FROM users WHERE telegram_id = ?', [uid]);
+  const v = !!(r && Number(r.banned) === 1);
+  BAN_CACHE.set(uid, { v, t: Date.now() });
+  return v;
+}
 function ogActive(row, now) { return !!row.og_pass && Number(row.og_expires_at) > (now || Math.floor(Date.now() / 1000)); }
 function effPerHour(row, now) { return (Number(row.per_hour) || 0) * (ogActive(row, now) ? 2 : 1); }
 async function normalizeOg(row, now) {
@@ -571,7 +611,8 @@ function userToClient(row) {
     level: row.level,
     levelPct: row.level_pct,
     balance: Math.floor(row.balance || 0),
-    perTap: row.per_tap,
+    perTap: effPerTap(row),
+    perTapExtra: tapExtraOf(row),
     perHour: effPerHour(row),
     basePerHour: row.per_hour,
     toLvlUp: row.to_lvl_up,
@@ -617,6 +658,12 @@ app.post('/api/auth', authMiddleware, async (req, res) => {
   row.max_energy = effMaxEnergy(row);
   await dbx.run('UPDATE users SET energy = ?, max_energy = ?, energy_bonus = ? WHERE telegram_id = ?', [row.energy, row.max_energy, _bonus, row.telegram_id]);
   await normalizeOg(row, now);
+  let freeSpin = false;
+  const today = Math.floor(now / 86400);
+  if (Number(row.free_spin_day) !== today) {
+    const g = await dbx.run('UPDATE users SET spins = spins + 1, free_spin_day = ? WHERE telegram_id = ? AND COALESCE(free_spin_day, 0) <> ?', [today, row.telegram_id, today]);
+    if (g.changes) { row.spins = (Number(row.spins) || 0) + 1; row.free_spin_day = today; freeSpin = true; }
+  }
   const gap = now - lastActive;
   const gained = await accrueIncome(row, now);
   let offlineEarned = gap > 120 ? gained : 0; // shown in the "while you were offline" popup
@@ -654,10 +701,13 @@ app.post('/api/auth', authMiddleware, async (req, res) => {
     player: playerPayload,
     user: playerPayload,
     offlineEarned,
+    freeSpin,
     config: {
       ...config,
       tasks: config.tasks.map(t => { const rep = t.section === 'watch'; return { ...t, blockId: t.block_id || '', repeatable: rep, done: rep ? false : doneTasks.includes(t.id) }; }),
-      boosters: boostersWithLevel
+      boosters: boostersWithLevel,
+      cards: cardsForUser(config.cards, ownedCards),
+      shopBoosts: shopBoostsForUser(config.shopBoosts, ownedBoosters, config.boosters)
     },
     ownedCards,
     friends: friends.map(f => ({
@@ -695,9 +745,9 @@ app.post('/api/tap', authMiddleware, async (req, res) => {
 
   const nowT = Math.floor(Date.now() / 1000);
   await normalizeOg(row, nowT);
-  await accrueIncome(row, nowT);
+  if (nowT - (Number(row.last_income_at) || nowT) <= 90) await accrueIncome(row, nowT); // longer gaps are paid via the 'welcome back' popup
   const lv = levelFromBalance(row.balance);
-  const perTap = Math.max(Number(row.per_tap) || 1, lv.baseTap) + (ogActive(row, nowT) ? 2 : 0);
+  const perTap = effPerTap(row, nowT);
   const gain = perTap * taps;
   const curEnergy = regenEnergy(row, nowT);
   if (curEnergy < taps) return res.status(400).json({ error: 'Not enough energy', energy: Math.floor(curEnergy) });
@@ -873,8 +923,13 @@ app.get('/api/user/me', authMiddleware, async (req, res) => {
   if (!row) return res.status(404).json({ error: 'Not found' });
   const nowM = Math.floor(Date.now() / 1000);
   await normalizeOg(row, nowM);
-  await accrueIncome(row, nowM);
-  res.json({ user: userToClient(row), player: userToClient(row) });
+  const gapM = nowM - (Number(row.last_income_at) || nowM);
+  if (gapM > 90 && req.query.returning !== '1') {  // was away: let the app ask for the popup
+    return res.json({ user: userToClient(row), player: userToClient(row), away: true });
+  }
+  const gainedM = await accrueIncome(row, nowM);
+  await dbx.run('UPDATE users SET last_active = ? WHERE telegram_id = ?', [nowM, row.telegram_id]);
+  res.json({ user: userToClient(row), player: userToClient(row), offlineEarned: req.query.returning === '1' ? gainedM : 0 });
 });
 
 app.get('/api/config', authMiddleware, async (req, res) => {
@@ -882,6 +937,10 @@ app.get('/api/config', authMiddleware, async (req, res) => {
   const rows = await dbx.all('SELECT task_id FROM user_tasks WHERE telegram_id = ? AND done = 1', [req.tg.user.id]);
   const done = (rows || []).map(r => r.task_id);
   config.tasks = config.tasks.map(t => { const rep = t.section === 'watch'; return { ...t, blockId: t.block_id || '', repeatable: rep, done: rep ? false : done.includes(t.id) }; });
+  const oc = await dbx.all('SELECT card_id, level FROM user_cards WHERE telegram_id = ?', [req.tg.user.id]);
+  const ob = await dbx.all('SELECT booster_id, level FROM user_boosters WHERE telegram_id = ?', [req.tg.user.id]);
+  config.cards = cardsForUser(config.cards, oc);
+  config.shopBoosts = shopBoostsForUser(config.shopBoosts, ob, config.boosters);
   res.json(config);
 });
 
@@ -1175,8 +1234,8 @@ app.post('/api/wallet', authMiddleware, async (req, res) => {
   const wallet = String(req.body?.wallet || '').trim();
   if (!wallet) return res.status(400).json({ error: 'wallet required' });
   if (isTestnetAddr(wallet)) return res.status(400).json({ error: 'Testnet wallets are not allowed. Use a Mainnet wallet.' });
-  await dbx.run('UPDATE users SET wallet = ?, updated_at = ? WHERE telegram_id = ?', [wallet, Math.floor(Date.now() / 1000), req.tg.user.id]);
-  res.json({ ok: true, wallet });
+  await dbx.run('UPDATE users SET wallet = ?, updated_at = ? WHERE telegram_id = ?', [toFriendlyAddr(wallet), Math.floor(Date.now() / 1000), req.tg.user.id]);
+  res.json({ ok: true, wallet: toFriendlyAddr(wallet) });
 });
 
 
@@ -1191,7 +1250,7 @@ app.post('/api/user/sync', authMiddleware, async (req, res) => {
   const row = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [id]);
   if (!row) return res.status(404).json({ error: 'Not found' });
   // SECURITY: balance/spins are server-authoritative; only wallet is accepted from the client
-  if (wallet && !isTestnetAddr(wallet)) await dbx.run('UPDATE users SET wallet=?, last_active=?, updated_at=? WHERE telegram_id=?', [String(wallet).slice(0, 128), now, now, id]);
+  if (wallet && !isTestnetAddr(wallet)) await dbx.run('UPDATE users SET wallet=?, last_active=?, updated_at=? WHERE telegram_id=?', [toFriendlyAddr(String(wallet)).slice(0, 128), now, now, id]);
   const updated = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [id]);
   res.json({ ok: true, player: userToClient(updated), user: userToClient(updated) });
 });
@@ -1221,6 +1280,8 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) =>
       handle: r.handle,
       balance: Math.floor(r.balance || 0),
       shhhtoshi: Math.floor(r.balance || 0),
+      wallet: toFriendlyAddr(r.wallet || ''),
+      banned: Number(r.banned) === 1,
       spins: r.spins
     }))
   });
@@ -1228,14 +1289,21 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) =>
 
 app.post('/api/admin/user/:id/balance', authMiddleware, adminMiddleware, async (req, res) => {
   const id = Number(req.params.id);
-  const bal = Number(req.body.balance != null ? req.body.balance : req.body.shhhtoshi);
+  let bal = Number(req.body.balance != null ? req.body.balance : req.body.shhhtoshi);
+  if (req.body.mode === 'add' || req.body.mode === 'deduct') {
+    const cur = await dbx.get('SELECT balance FROM users WHERE telegram_id = ?', [id]);
+    if (!cur) return res.status(404).json({ error: 'User not found' });
+    const amt = Math.floor(Math.abs(Number(req.body.amount)));
+    if (!amt) return res.status(400).json({ error: 'Enter an amount' });
+    bal = Math.max(0, (Number(cur.balance) || 0) + (req.body.mode === 'add' ? amt : -amt));
+  }
   if (Number.isNaN(bal)) return res.status(400).json({ error: 'Invalid balance' });
   const now = Math.floor(Date.now() / 1000);
   const lv = levelFromBalance(bal);
   const extraTap = 0;
   await dbx.run(
-    'UPDATE users SET balance = ?, per_tap = ?, max_energy = ?, energy = ?, updated_at = ? WHERE telegram_id = ?',
-    [bal, lv.baseTap + extraTap, lv.energy, lv.energy, now, id]
+    'UPDATE users SET balance = ?, max_energy = ?, energy = MIN(energy, ?), updated_at = ? WHERE telegram_id = ?'.replace('MIN(', dbx.isPg() ? 'LEAST(' : 'MIN('),
+    [bal, lv.energy + energyBonusOf(await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [id]) || {}), lv.energy, now, id]
   );
   const row = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [id]);
   res.json({ ok: true, user: row ? userToClient(row) : null });
@@ -1248,9 +1316,14 @@ app.get('/api/admin/user/:id/history', authMiddleware, adminMiddleware, async (r
 });
 
 app.post('/api/admin/user/:id/ban', authMiddleware, adminMiddleware, async (req, res) => {
+  const id = Number(req.params.id);
+  if (ADMIN_TELEGRAM_IDS.includes(id)) return res.status(400).json({ error: 'Cannot ban an admin' });
+  await dbx.run('UPDATE users SET banned = 1 WHERE telegram_id = ?', [id]); BAN_CACHE.delete(id);
   res.json({ ok: true });
 });
 app.post('/api/admin/user/:id/unban', authMiddleware, adminMiddleware, async (req, res) => {
+  const id = Number(req.params.id);
+  await dbx.run('UPDATE users SET banned = 0 WHERE telegram_id = ?', [id]); BAN_CACHE.delete(id);
   res.json({ ok: true });
 });
 
@@ -1513,7 +1586,7 @@ app.post('/api/user/wallet', authMiddleware, async (req, res) => {
   if (!addr) return res.status(400).json({ error: 'wallet required' });
   if (isTestnetAddr(addr)) return res.status(400).json({ error: 'Testnet wallets are not allowed. Use a Mainnet wallet.' });
   await dbx.run('UPDATE users SET wallet = ?, updated_at = ? WHERE telegram_id = ?',
-    [addr, Math.floor(Date.now() / 1000), req.tg.user.id]);
+    [toFriendlyAddr(addr), Math.floor(Date.now() / 1000), req.tg.user.id]);
   res.json({ ok: true, wallet: addr });
 });
 
@@ -1638,17 +1711,33 @@ app.get('/api/spin/status', authMiddleware, async (req, res) => {
 app.get('/api/income-cards', authMiddleware, async (req, res) => {
   const cards = await getCards();
   const owned = await dbx.all('SELECT card_id, level FROM user_cards WHERE telegram_id = ?', [req.tg.user.id]);
-  res.json({ cards: cards.map(c => { const o = owned.find(x => x.card_id === c.id); return { id: c.id, title: c.name, sp_per_hour: c.per_hour, image_url: c.img || '', category: c.category, name: c.name, per_hour: c.per_hour, perHour: c.per_hour, cost: c.cost, price_sp: c.cost, locked: !!c.locked, img: c.img || '', level: o ? o.level : 0, pay_methods: ['sp'] }; }) });
+  res.json({ cards: cards.map(c => {
+    const o = owned.find(x => x.card_id === c.id), L = Math.min(CARD_MAX, o ? Number(o.level) || 0 : 0);
+    return { id: c.id, title: c.name, name: c.name, category: c.category, sp_per_hour: c.per_hour, per_hour: c.per_hour, perHour: c.per_hour,
+      cost: c.cost, price_sp: c.cost, image_url: c.img || '', img: c.img || '', locked: !!c.locked, lockText: c.lock_text || '', pay_methods: ['sp'], ...cardView(c, L) };
+  }) });
 });
+
 app.post('/api/income-cards/buy', authMiddleware, async (req, res) => {
+  const uid = req.tg.user.id, now = Math.floor(Date.now() / 1000);
   const card = await dbx.get('SELECT * FROM cards WHERE id = ? AND active = 1', [req.body.card_id]);
   if (!card || card.locked) return res.status(400).json({ error: 'Card not available' });
-  if (req.body.method && req.body.method !== 'sp') return res.status(400).json({ error: 'Use Stars (paid via bot) or balance' });
-  const paid = await dbx.run('UPDATE users SET balance = balance - ?, per_hour = per_hour + ?, updated_at = ? WHERE telegram_id = ? AND balance >= ?', [card.cost, card.per_hour, Math.floor(Date.now() / 1000), req.tg.user.id, card.cost]);
-  if (!paid.changes) return res.status(400).json({ error: 'Not enough balance' });
-  await dbx.run('INSERT INTO user_cards (telegram_id, card_id, level) VALUES (?, ?, 1) ON CONFLICT(telegram_id, card_id) DO UPDATE SET level = user_cards.level + 1', [req.tg.user.id, card.id]);
-  const u = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [req.tg.user.id]);
-  res.json({ ok: true, balance: Math.floor(u.balance), perHour: u.per_hour, user: userToClient(u) });
+  if (req.body.method && req.body.method !== 'sp') return res.status(400).json({ error: 'Pay with your balance' });
+  await dbx.run('INSERT OR IGNORE INTO user_cards (telegram_id, card_id, level) VALUES (?, ?, 0)', [uid, card.id]);
+  const own = await dbx.get('SELECT level FROM user_cards WHERE telegram_id = ? AND card_id = ?', [uid, card.id]);
+  const L = Number(own && own.level) || 0;
+  if (L >= CARD_MAX) return res.status(400).json({ error: 'Max level reached' });
+  const v = cardView(card, L);
+  const lock = await dbx.run('UPDATE user_cards SET level = level + 1 WHERE telegram_id = ? AND card_id = ? AND level = ?', [uid, card.id, L]);
+  if (!lock.changes) return res.status(409).json({ error: 'Try again' });
+  const paid = await dbx.run('UPDATE users SET balance = balance - ?, updated_at = ? WHERE telegram_id = ? AND balance >= ?', [v.nextCost, now, uid, v.nextCost]);
+  if (!paid.changes) { await dbx.run('UPDATE user_cards SET level = level - 1 WHERE telegram_id = ? AND card_id = ?', [uid, card.id]); return res.status(400).json({ error: 'Not enough balance' }); }
+  // income is always rebuilt from owned levels (self-healing)
+  const all = await dbx.all('SELECT c.per_hour, uc.level FROM user_cards uc JOIN cards c ON c.id = uc.card_id WHERE uc.telegram_id = ?', [uid]);
+  const total = (all || []).reduce((s, r) => s + cardIncome(r, Number(r.level) || 0), 0);
+  await dbx.run('UPDATE users SET per_hour = ? WHERE telegram_id = ?', [total, uid]);
+  const u = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [uid]);
+  res.json({ ok: true, balance: Math.floor(u.balance), perHour: effPerHour(u, now), user: userToClient(u), card: { id: card.id, ...cardView(card, L + 1) } });
 });
 app.post('/api/settings', authMiddleware, adminMiddleware, async (req, res) => {
   for (const [k, v] of Object.entries(req.body || {})) if (/^[a-z0-9_]+$/i.test(k) && !k.startsWith('paid_')) await setSetting(k, v);
@@ -1700,10 +1789,13 @@ app.post('/api/shop-boosts/claim', authMiddleware, async (req, res) => {
   if (req.body.payment_ok) return res.status(402).json({ error: 'Payment not verified' });
   const b = await dbx.get('SELECT * FROM boosters WHERE id = ? AND active = 1', [req.body.boost_id]);
   if (!b) return res.status(400).json({ error: 'Booster not available' });
-  const uid = req.tg.user.id, now = Math.floor(Date.now() / 1000), cost = Number(b.base_cost) || 0, v = Number(b.effect_value) || 1;
+  const uid = req.tg.user.id, now = Math.floor(Date.now() / 1000), v = Number(b.effect_value) || 1;
   const row = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [uid]);
+  const ow = await dbx.get('SELECT level FROM user_boosters WHERE telegram_id = ? AND booster_id = ?', [uid, b.id]);
+  const L = Number(ow && ow.level) || 0, cost = boosterPrice(b, L);
   const col = { multitap: 'per_tap', energy_limit: 'max_energy', mining_timer: 'mining_timer_hrs' }[b.effect_type];
   const isEn = b.effect_type === 'energy_limit';
+  if (b.effect_type === 'mining_timer' && (Number(row.mining_timer_hrs) || 3) >= 12) return res.status(400).json({ error: 'Max offline mining reached' });
   const sets = isEn ? 'max_energy = max_energy + ?, energy_bonus = COALESCE(energy_bonus, max_energy - 1000) + ?' : (col ? `${col} = ${col} + ?` : (b.effect_type === 'full_energy' ? 'energy = max_energy' : null));
   if (!sets) return res.status(400).json({ error: 'Booster not available' });
   if (b.effect_type === 'full_energy' && !(await takeDailyRefill(uid, row, now))) return res.status(400).json({ error: 'Daily refill used — come back tomorrow' });
@@ -1711,8 +1803,10 @@ app.post('/api/shop-boosts/claim', authMiddleware, async (req, res) => {
     isEn ? [cost, v, v, now, uid, cost] : (col ? [cost, v, now, uid, cost] : [cost, now, uid, cost]));
   if (!r.changes) return res.status(400).json({ error: 'Not enough balance' });
   await dbx.run('INSERT INTO user_boosters (telegram_id, booster_id, level) VALUES (?, ?, 1) ON CONFLICT(telegram_id, booster_id) DO UPDATE SET level = user_boosters.level + 1', [uid, b.id]);
-  res.json({ ok: true });
+  const u = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [uid]);
+  res.json({ ok: true, user: userToClient(u) });
 });
+
 
 app.get('/api/health', async (req, res) => {
       res.json({ ok: true, ts: Date.now(), db: dbx.isPg() ? 'postgres' : 'sqlite' });
