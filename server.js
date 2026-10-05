@@ -137,6 +137,8 @@ async function ensureDb() {
     try { await dbx.exec('ALTER TABLE friends ADD COLUMN reward INTEGER DEFAULT 0'); } catch (_) {}
     try { await dbx.exec('ALTER TABLE users ADD COLUMN og_expires_at INTEGER DEFAULT 0'); } catch (_) {}
     try { await dbx.exec('ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0'); } catch (_) {}
+    try { await dbx.exec('ALTER TABLE users ADD COLUMN last_seen_at INTEGER DEFAULT 0'); } catch (_) {}
+    try { await dbx.exec("ALTER TABLE tasks ADD COLUMN chat_id TEXT DEFAULT ''"); } catch (_) {}
     try { await dbx.exec('ALTER TABLE users ADD COLUMN free_spin_day INTEGER DEFAULT 0'); } catch (_) {}
     try { await dbx.exec('ALTER TABLE users ADD COLUMN last_income_at INTEGER DEFAULT 0'); } catch (_) {}
     try { await dbx.exec("ALTER TABLE tasks ADD COLUMN block_id TEXT DEFAULT ''"); } catch (_) {}
@@ -664,10 +666,10 @@ app.post('/api/auth', authMiddleware, async (req, res) => {
     const g = await dbx.run('UPDATE users SET spins = spins + 1, free_spin_day = ? WHERE telegram_id = ? AND COALESCE(free_spin_day, 0) <> ?', [today, row.telegram_id, today]);
     if (g.changes) { row.spins = (Number(row.spins) || 0) + 1; row.free_spin_day = today; freeSpin = true; }
   }
-  const gap = now - lastActive;
+  const gap = now - (Number(row.last_seen_at) || lastActive);
   const gained = await accrueIncome(row, now);
   let offlineEarned = gap > 120 ? gained : 0; // shown in the "while you were offline" popup
-  await dbx.run('UPDATE users SET last_active = ? WHERE telegram_id = ?', [now, row.telegram_id]);
+  await dbx.run('UPDATE users SET last_active = ?, last_seen_at = ? WHERE telegram_id = ?', [now, now, row.telegram_id]);
 
   const ownedCards = await dbx.all('SELECT card_id, level FROM user_cards WHERE telegram_id = ?', [row.telegram_id]);
   const ownedBoosters = await dbx.all('SELECT booster_id, level FROM user_boosters WHERE telegram_id = ?', [row.telegram_id]);
@@ -704,7 +706,7 @@ app.post('/api/auth', authMiddleware, async (req, res) => {
     freeSpin,
     config: {
       ...config,
-      tasks: config.tasks.map(t => { const rep = t.section === 'watch'; return { ...t, blockId: t.block_id || '', repeatable: rep, done: rep ? false : doneTasks.includes(t.id) }; }),
+      tasks: config.tasks.map(t => { const rep = t.section === 'watch'; return { ...t, tg: isTgTask(t), blockId: t.block_id || '', repeatable: rep, done: rep ? false : doneTasks.includes(t.id) }; }),
       boosters: boostersWithLevel,
       cards: cardsForUser(config.cards, ownedCards),
       shopBoosts: shopBoostsForUser(config.shopBoosts, ownedBoosters, config.boosters)
@@ -745,15 +747,16 @@ app.post('/api/tap', authMiddleware, async (req, res) => {
 
   const nowT = Math.floor(Date.now() / 1000);
   await normalizeOg(row, nowT);
-  if (nowT - (Number(row.last_income_at) || nowT) <= 90) await accrueIncome(row, nowT); // longer gaps are paid via the 'welcome back' popup
+  const awayTap = nowT - (Number(row.last_seen_at) || nowT) > 120;
+  if (!awayTap) await accrueIncome(row, nowT); // long gaps are paid through the 'welcome back' popup
   const lv = levelFromBalance(row.balance);
   const perTap = effPerTap(row, nowT);
   const gain = perTap * taps;
   const curEnergy = regenEnergy(row, nowT);
   if (curEnergy < taps) return res.status(400).json({ error: 'Not enough energy', energy: Math.floor(curEnergy) });
   const newMax = effMaxEnergy({ balance: (Number(row.balance) || 0) + gain, max_energy: row.max_energy, energy_bonus: row.energy_bonus });
-  await dbx.run('UPDATE users SET energy = ?, max_energy = ?, energy_bonus = ?, balance = balance + ?, last_active = ?, updated_at = ? WHERE telegram_id = ?',
-    [Math.min(newMax, curEnergy - taps), newMax, energyBonusOf(row), gain, nowT, nowT, user.id]);
+  await dbx.run('UPDATE users SET energy = ?, max_energy = ?, energy_bonus = ?, balance = balance + ?, last_active = ?, last_seen_at = ?, updated_at = ? WHERE telegram_id = ?',
+    [Math.min(newMax, curEnergy - taps), newMax, energyBonusOf(row), gain, nowT, nowT, nowT, user.id]);
   const updated = await dbx.get('SELECT balance, energy FROM users WHERE telegram_id = ?', [user.id]);
   res.json({ balance: Math.floor(updated.balance), energy: Math.floor(updated.energy), earned: gain });
 });
@@ -851,12 +854,33 @@ app.post('/api/shop/booster', authMiddleware, async (req, res) => {
 });
 
 // Complete task (atomic: reward can only be paid once)
+async function verifyTgMembership(task, uid) {
+  let chat = String(task.chat_id || '').trim();
+  if (!chat) {
+    const m = String(task.link || '').match(/(?:^|\/\/)(?:www\.)?(?:t|telegram)\.me\/(?:s\/)?([A-Za-z0-9_+]+)/i);
+    if (m && m[1] && m[1][0] !== '+' && !/^joinchat$/i.test(m[1])) chat = '@' + m[1];
+  }
+  if (!chat) return null;                              // not a Telegram task we can check
+  const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: /^-?\d+$/.test(chat) ? Number(chat) : chat, user_id: uid })
+  }).then(x => x.json()).catch(() => null);
+  if (!r || !r.ok) { console.warn('[task] cannot verify', chat, r && r.description); return false; }
+  const st = r.result.status;
+  return st === 'creator' || st === 'administrator' || st === 'member' || (st === 'restricted' && !!r.result.is_member);
+}
+function isTgTask(t) { return !!(t.chat_id || /(^|\/\/)(www\.)?(t|telegram)\.me\//i.test(String(t.link || ''))); }
 async function completeTask(req, res) {
   const { user } = req.tg;
   const task = await dbx.get('SELECT * FROM tasks WHERE id = ? AND active = 1', [req.body.taskId]);
   if (!task) return res.status(400).json({ error: 'Task not found' });
   const now = Math.floor(Date.now() / 1000);
   if (task.section === 'daily') return res.status(400).json({ error: 'Use the Daily Check-in' });
+  if (task.section !== 'watch') {
+    const done0 = await dbx.get('SELECT done FROM user_tasks WHERE telegram_id = ? AND task_id = ?', [user.id, task.id]);
+    if (done0 && done0.done) return res.status(400).json({ error: 'Already completed' });
+    if ((await verifyTgMembership(task, user.id)) === false) return res.status(400).json({ error: 'Task not completed', notCompleted: true });
+  }
   if (task.section === 'watch') {
     // repeatable (ads): per-day cap + cooldown, enforced atomically
     const cooldown = Number(await getSetting('watch_cooldown_sec', '30')) || 30;
@@ -923,20 +947,21 @@ app.get('/api/user/me', authMiddleware, async (req, res) => {
   if (!row) return res.status(404).json({ error: 'Not found' });
   const nowM = Math.floor(Date.now() / 1000);
   await normalizeOg(row, nowM);
-  const gapM = nowM - (Number(row.last_income_at) || nowM);
-  if (gapM > 90 && req.query.returning !== '1') {  // was away: let the app ask for the popup
+  const gapM = nowM - (Number(row.last_seen_at) || Number(row.last_active) || nowM);
+  const wasAway = gapM > 120;
+  if (wasAway && req.query.returning !== '1') {          // genuinely away: let the app ask for the popup
     return res.json({ user: userToClient(row), player: userToClient(row), away: true });
   }
   const gainedM = await accrueIncome(row, nowM);
-  await dbx.run('UPDATE users SET last_active = ? WHERE telegram_id = ?', [nowM, row.telegram_id]);
-  res.json({ user: userToClient(row), player: userToClient(row), offlineEarned: req.query.returning === '1' ? gainedM : 0 });
+  await dbx.run('UPDATE users SET last_seen_at = ? WHERE telegram_id = ?', [nowM, row.telegram_id]);
+  res.json({ user: userToClient(row), player: userToClient(row), offlineEarned: (req.query.returning === '1' && wasAway) ? gainedM : 0 });
 });
 
 app.get('/api/config', authMiddleware, async (req, res) => {
   const config = await loadGameConfig();
   const rows = await dbx.all('SELECT task_id FROM user_tasks WHERE telegram_id = ? AND done = 1', [req.tg.user.id]);
   const done = (rows || []).map(r => r.task_id);
-  config.tasks = config.tasks.map(t => { const rep = t.section === 'watch'; return { ...t, blockId: t.block_id || '', repeatable: rep, done: rep ? false : done.includes(t.id) }; });
+  config.tasks = config.tasks.map(t => { const rep = t.section === 'watch'; return { ...t, tg: isTgTask(t), blockId: t.block_id || '', repeatable: rep, done: rep ? false : done.includes(t.id) }; });
   const oc = await dbx.all('SELECT card_id, level FROM user_cards WHERE telegram_id = ?', [req.tg.user.id]);
   const ob = await dbx.all('SELECT booster_id, level FROM user_boosters WHERE telegram_id = ?', [req.tg.user.id]);
   config.cards = cardsForUser(config.cards, oc);
@@ -960,16 +985,16 @@ app.get('/api/admin/tasks', authMiddleware, adminMiddleware, async (req, res) =>
 });
 
 app.post('/api/admin/tasks', authMiddleware, adminMiddleware, async (req, res) => {
-  const { id, section, name, reward, icon, img, link, sort_order, active, block_id } = req.body;
+  const { id, section, name, reward, icon, img, link, sort_order, active, block_id, chat_id } = req.body;
   const taskId = id || ('t' + Date.now());
   if (!name || !section) return res.status(400).json({ error: 'name and section required' });
 
   await dbx.run(`
-    INSERT INTO tasks (id, section, name, reward, icon, img, link, block_id, sort_order, active)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO tasks (id, section, name, reward, icon, img, link, block_id, chat_id, sort_order, active)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       section=excluded.section, name=excluded.name, reward=excluded.reward,
-      icon=excluded.icon, img=excluded.img, link=excluded.link, block_id=excluded.block_id,
+      icon=excluded.icon, img=excluded.img, link=excluded.link, block_id=excluded.block_id, chat_id=excluded.chat_id,
       sort_order=excluded.sort_order, active=excluded.active
   `, [taskId,
     section || 'social',
@@ -978,7 +1003,8 @@ app.post('/api/admin/tasks', authMiddleware, adminMiddleware, async (req, res) =
     icon || '⭐',
     img || '',
     link || '',
-    String(block_id || '').trim(),
+    section === 'watch' ? String(block_id || '').trim() : '',
+    section === 'social' ? String(chat_id || '').trim() : '',
     Number(sort_order) || 0,
     active === undefined || active === true || active === 1 ? 1 : 0]);
   res.json({ ok: true, id: taskId, tasks: await dbx.all('SELECT * FROM tasks ORDER BY section, sort_order, id', []) });
