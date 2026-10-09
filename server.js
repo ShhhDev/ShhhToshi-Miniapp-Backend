@@ -633,9 +633,13 @@ async function walletTaken(uid, addr) {
   const r = await dbx.get('SELECT telegram_id FROM users WHERE wallet IN (?, ?, ?, ?) AND telegram_id <> ? LIMIT 1', [f.uq, f.eq, f.raw, String(addr).trim(), uid]);
   return !!r;
 }
+// True when the player's max energy is now higher than the max we last stored (level-up, booster, etc.)
+function maxEnergyGrew(row) { return effMaxEnergy(row) > (Number(row.max_energy) || 0); }
 function regenEnergy(row, now) {
+  const max = effMaxEnergy(row);
+  if (maxEnergyGrew(row)) return max; // max energy increased -> refill to full instead of making the player wait
   const dt = Math.max(0, now - (Number(row.last_active) || now));
-  return Math.min(effMaxEnergy(row), (Number(row.energy) || 0) + dt);
+  return Math.min(max, (Number(row.energy) || 0) + dt);
 }
 function userToClient(row) {
   return {
@@ -652,7 +656,7 @@ function userToClient(row) {
     perHour: effPerHour(row),
     basePerHour: row.per_hour,
     toLvlUp: row.to_lvl_up,
-    energy: Math.min(Math.floor(row.energy || 0), effMaxEnergy(row)),
+    energy: maxEnergyGrew(row) ? effMaxEnergy(row) : Math.min(Math.floor(row.energy || 0), effMaxEnergy(row)),
     maxEnergy: effMaxEnergy(row),
     energyBonus: energyBonusOf(row),
     streakDay: (row.last_claim_daily && Math.floor(Date.now() / 1000) - row.last_claim_daily > 48 * 3600) ? 1 : row.streak_day,
@@ -789,7 +793,7 @@ app.post('/api/tap', authMiddleware, async (req, res) => {
   if (curEnergy < taps) return res.status(400).json({ error: 'Not enough energy', energy: Math.floor(curEnergy) });
   const newMax = effMaxEnergy({ balance: (Number(row.balance) || 0) + gain, max_energy: row.max_energy, energy_bonus: row.energy_bonus });
   await dbx.run('UPDATE users SET energy = ?, max_energy = ?, energy_bonus = ?, balance = balance + ?, last_active = ?, last_seen_at = ?, updated_at = ? WHERE telegram_id = ?',
-    [Math.min(newMax, curEnergy - taps), newMax, energyBonusOf(row), gain, nowT, nowT, nowT, user.id]);
+    [newMax > (Number(row.max_energy) || 0) ? newMax : Math.min(newMax, curEnergy - taps), newMax, energyBonusOf(row), gain, nowT, nowT, nowT, user.id]);
   const updated = await dbx.get('SELECT balance, energy FROM users WHERE telegram_id = ?', [user.id]);
   res.json({ balance: Math.floor(updated.balance), energy: Math.floor(updated.energy), earned: gain });
 });
@@ -866,6 +870,9 @@ app.post('/api/shop/booster', authMiddleware, async (req, res) => {
   if (booster.effect_type === 'energy_limit') newBonus += (booster.effect_value || 500);
   if (booster.effect_type === 'mining_timer') newMining += (booster.effect_value || 1);
   newMaxEnergy = levelFromBalance((Number(row.balance) || 0) - cost).energy + newBonus;
+  // max energy went up (energy-limit booster / level change) -> fill the bar to the new max
+  if (newMaxEnergy > (Number(row.max_energy) || 0)) newEnergy = newMaxEnergy;
+  else newEnergy = Math.min(Number(newEnergy) || 0, newMaxEnergy);
   if (booster.effect_type === 'full_energy') {
     if (!(await takeDailyRefill(user.id, row, Math.floor(Date.now() / 1000)))) return res.status(400).json({ error: 'Daily refill used — come back tomorrow' });
     newEnergy = newMaxEnergy;
@@ -988,7 +995,8 @@ app.post('/api/spin', authMiddleware, async (req, res) => {
     sets.push('balance = balance + ?'); par.push(amount); message = 'You won ' + amount.toLocaleString('en-US') + ' $SHHHT';
   } else if (seg === 'battery') {
     const nb = energyBonusOf(row) + 100;
-    sets.push('energy_bonus = ?', 'max_energy = ?'); par.push(nb, effMaxEnergy({ balance: row.balance, energy_bonus: nb, max_energy: row.max_energy }));
+    const nm = effMaxEnergy({ balance: row.balance, energy_bonus: nb, max_energy: row.max_energy });
+    sets.push('energy_bonus = ?', 'max_energy = ?', 'energy = ?'); par.push(nb, nm, nm); // new limit -> fill to full
     message = '+100 max energy';
   } else if (seg === 'hand') { sets.push('per_tap = per_tap + 1'); message = '+1 per tap'; }
   else if (seg === 'watch') { sets.push('mining_timer_hrs = CASE WHEN mining_timer_hrs < 12 THEN mining_timer_hrs + 1 ELSE mining_timer_hrs END'); message = '+1 hour offline mining'; }
@@ -1393,9 +1401,12 @@ app.post('/api/admin/user/:id/balance', authMiddleware, adminMiddleware, async (
   const now = Math.floor(Date.now() / 1000);
   const lv = levelFromBalance(bal);
   const extraTap = 0;
+  const _cur = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [id]) || {};
+  const _newMax = lv.energy + energyBonusOf(_cur);
+  const _grew = _newMax > (Number(_cur.max_energy) || 0);
   await dbx.run(
-    'UPDATE users SET balance = ?, max_energy = ?, energy = MIN(energy, ?), updated_at = ? WHERE telegram_id = ?'.replace('MIN(', dbx.isPg() ? 'LEAST(' : 'MIN('),
-    [bal, lv.energy + energyBonusOf(await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [id]) || {}), lv.energy, now, id]
+    'UPDATE users SET balance = ?, max_energy = ?, energy = ?, updated_at = ? WHERE telegram_id = ?',
+    [bal, _newMax, _grew ? _newMax : Math.min(Number(_cur.energy) || 0, _newMax), now, id]
   );
   const row = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [id]);
   res.json({ ok: true, user: row ? userToClient(row) : null });
@@ -1896,7 +1907,12 @@ app.post('/api/shop-boosts/claim', authMiddleware, async (req, res) => {
     isEn ? [cost, v, v, now, uid, cost] : (col ? [cost, v, now, uid, cost] : [cost, now, uid, cost]));
   if (!r.changes) return res.status(400).json({ error: 'Not enough balance' });
   await dbx.run('INSERT INTO user_boosters (telegram_id, booster_id, level) VALUES (?, ?, 1) ON CONFLICT(telegram_id, booster_id) DO UPDATE SET level = user_boosters.level + 1', [uid, b.id]);
-  const u = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [uid]);
+  let u = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [uid]);
+  if (isEn) {
+    const m = effMaxEnergy(u);
+    await dbx.run('UPDATE users SET energy = ?, max_energy = ? WHERE telegram_id = ?', [m, m, uid]); // new limit -> fill to full
+    u = await dbx.get('SELECT * FROM users WHERE telegram_id = ?', [uid]);
+  }
   res.json({ ok: true, user: userToClient(u) });
 });
 
