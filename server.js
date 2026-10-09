@@ -146,6 +146,7 @@ async function ensureDb() {
   try { await dbx.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_wallet_uq ON users(wallet) WHERE wallet IS NOT NULL AND wallet <> ''"); } catch (e) { console.warn('wallet unique index skipped (duplicates exist):', e.message); }
   await dbx.exec('CREATE TABLE IF NOT EXISTS ton_orders (nonce TEXT PRIMARY KEY, telegram_id BIGINT, kind TEXT, amount_ton REAL, created_at BIGINT, status TEXT, tx_hash TEXT)');
   await dbx.exec('CREATE TABLE IF NOT EXISTS task_claims (telegram_id BIGINT, task_id TEXT, day INTEGER, cnt INTEGER DEFAULT 0, last_at BIGINT DEFAULT 0, PRIMARY KEY (telegram_id, task_id, day))');
+  await dbx.exec('CREATE TABLE IF NOT EXISTS ad_credits (telegram_id BIGINT PRIMARY KEY, credits INTEGER DEFAULT 0, last_at BIGINT DEFAULT 0)');
   dbReady = true;
 }
 
@@ -913,6 +914,14 @@ async function completeTask(req, res) {
     if (done0 && done0.done) return res.status(400).json({ error: 'Already completed' });
     if ((await verifyTgMembership(task, user.id)) === false) return res.status(400).json({ error: 'Task not completed', notCompleted: true });
   }
+  let adCreditUsed = false;
+  if (task.section === 'watch') {
+    // Reward only after Adsgram's server confirmed the ad was FULLY watched (see /api/adsgram/reward)
+    const used = await dbx.run('UPDATE ad_credits SET credits = credits - 1 WHERE telegram_id = ? AND credits > 0 AND last_at >= ?', [user.id, now - 900]);
+    if (!used.changes) return res.status(409).json({ error: 'Ad not verified yet', adPending: true });
+    adCreditUsed = true;
+  }
+  const refundAd = async () => { if (adCreditUsed) await dbx.run('UPDATE ad_credits SET credits = credits + 1 WHERE telegram_id = ?', [user.id]); };
   if (task.section === 'watch') {
     // repeatable (ads): per-day cap + cooldown, enforced atomically
     const cooldown = Number(await getSetting('watch_cooldown_sec', '30')) || 30;
@@ -923,6 +932,7 @@ async function completeTask(req, res) {
       [now, user.id, task.id, day, cap, now - cooldown]);
     if (!c.changes) {
       const st = await dbx.get('SELECT cnt, last_at FROM task_claims WHERE telegram_id = ? AND task_id = ? AND day = ?', [user.id, task.id, day]);
+      await refundAd();
       if (st && st.cnt >= cap) return res.status(429).json({ error: 'Daily limit reached — come back tomorrow' });
       return res.status(429).json({ error: 'Wait ' + Math.max(1, cooldown - (now - (st ? st.last_at : 0))) + 's before the next one' });
     }
@@ -939,6 +949,24 @@ async function completeTask(req, res) {
 }
 app.post('/api/tasks/complete', authMiddleware, completeTask);
 app.post('/api/task/complete', authMiddleware, completeTask);
+
+// Adsgram server-to-server reward callback. Adsgram calls this ONLY after the user fully watched the ad.
+// Reward URL to put in the Adsgram dashboard:
+//   https://YOUR-BACKEND-DOMAIN/api/adsgram/reward?userid=[userId]&secret=YOUR_ADSGRAM_SECRET
+app.get('/api/adsgram/reward', async (req, res) => {
+  try {
+    const secret = process.env.ADSGRAM_SECRET || '';
+    const got = String(req.query.secret || '');
+    const a = Buffer.from(secret), b = Buffer.from(got);
+    if (!secret || a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(403).send('forbidden');
+    const uid = String(req.query.userid || req.query.userId || '').trim();
+    if (!/^\d{1,15}$/.test(uid)) return res.status(400).send('bad userid');
+    const now = Math.floor(Date.now() / 1000);
+    await dbx.run(`INSERT INTO ad_credits (telegram_id, credits, last_at) VALUES (?, 1, ?)
+      ON CONFLICT(telegram_id) DO UPDATE SET credits = CASE WHEN ad_credits.credits >= 3 THEN 3 ELSE ad_credits.credits + 1 END, last_at = ?`, [Number(uid), now, now]);
+    res.status(200).send('ok');
+  } catch (e) { console.error('[adsgram]', e.message); res.status(500).send('error'); }
+});
 
 // Spin
 app.post('/api/spin', authMiddleware, async (req, res) => {
@@ -1282,9 +1310,12 @@ app.post('/api/admin/withdrawals/:id', authMiddleware, adminMiddleware, async (r
 
 // Admin password verify (optional second gate for panel)
 app.post('/api/admin/verify-password', authMiddleware, adminMiddleware, async (req, res) => {
-  const expected = process.env.ADMIN_PANEL_PASSWORD || '';
+  // ignore spaces / line breaks / zero-width characters that often come along when pasting
+  const clean = v => String(v || '').replace(/[\s\u200B-\u200D\uFEFF\u00A0]/g, '');
+  const expected = clean(process.env.ADMIN_PANEL_PASSWORD);
   if (!expected) return res.status(503).json({ ok: false, error: 'ADMIN_PANEL_PASSWORD not set on server' });
-  const ok = String(req.body?.password || '') === expected;
+  const given = clean(req.body?.password);
+  const ok = given.length === expected.length && crypto.timingSafeEqual(Buffer.from(given), Buffer.from(expected));
   if (!ok) return res.status(403).json({ ok: false, error: 'Wrong password' });
   res.json({ ok: true });
 });
