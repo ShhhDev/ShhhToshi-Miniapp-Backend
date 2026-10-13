@@ -140,6 +140,7 @@ async function ensureDb() {
     try { await dbx.exec('ALTER TABLE users ADD COLUMN last_seen_at INTEGER DEFAULT 0'); } catch (_) {}
     try { await dbx.exec("ALTER TABLE tasks ADD COLUMN chat_id TEXT DEFAULT ''"); } catch (_) {}
     try { await dbx.exec('ALTER TABLE users ADD COLUMN free_spin_day INTEGER DEFAULT 0'); } catch (_) {}
+    try { await dbx.exec('ALTER TABLE users ADD COLUMN free_spin_left INTEGER DEFAULT 0'); } catch (_) {}
     try { await dbx.exec('ALTER TABLE users ADD COLUMN last_income_at INTEGER DEFAULT 0'); } catch (_) {}
     try { await dbx.exec("ALTER TABLE tasks ADD COLUMN block_id TEXT DEFAULT ''"); } catch (_) {}
   }
@@ -543,7 +544,7 @@ function levelTapTotal(balance) { const i = Math.max(0, LEVEL_TABLE.indexOf(leve
 function tapExtraOf(row) { return Math.max(0, (Number(row.per_tap) || 1) - 1) + (Number(row.tap_extra) || 0); }
 function effPerTap(row, now) { return levelTapTotal(row.balance) + tapExtraOf(row) + (ogActive(row, now) ? 2 : 0); }
 // Income cards: owned level L (0..8). Upgrade cost = base x 2^L; the upgrade L->L+1 adds base_ph x 1.5^L per hour
-const CARD_MAX = 8;
+const CARD_MAX = Infinity; // no level cap on cards
 function cardIncome(c, n) { let t = 0; for (let k = 0; k < n; k++) t += Math.round((Number(c.per_hour) || 0) * Math.pow(1.5, k)); return t; } // each upgrade adds base x 1.5^level
 function cardView(c, L) {
   return { level: L, maxed: L >= CARD_MAX, nextCost: Math.round((Number(c.cost) || 0) * Math.pow(2, L)), gain: cardIncome(c, L + 1) - cardIncome(c, L), curPerHour: cardIncome(c, L) };
@@ -700,8 +701,11 @@ app.post('/api/auth', authMiddleware, async (req, res) => {
   let freeSpin = false;
   const today = Math.floor(now / 86400);
   if (Number(row.free_spin_day) !== today) {
-    const g = await dbx.run('UPDATE users SET spins = spins + 1, free_spin_day = ? WHERE telegram_id = ? AND COALESCE(free_spin_day, 0) <> ?', [today, row.telegram_id, today]);
-    if (g.changes) { row.spins = (Number(row.spins) || 0) + 1; row.free_spin_day = today; freeSpin = true; }
+    // Daily free spin does NOT stack: yesterday's unused free spin expires, then exactly 1 is granted for today.
+    // First ever day: the account already starts with 1 spin, so don't add a second one.
+    const addOne = Number(row.free_spin_day) ? 1 : 0;
+    const g = await dbx.run('UPDATE users SET spins = (CASE WHEN spins - COALESCE(free_spin_left, 0) < 0 THEN 0 ELSE spins - COALESCE(free_spin_left, 0) END) + ?, free_spin_left = 1, free_spin_day = ? WHERE telegram_id = ? AND COALESCE(free_spin_day, 0) <> ?', [addOne, today, row.telegram_id, today]);
+    if (g.changes) { const fr = await dbx.get('SELECT spins FROM users WHERE telegram_id = ?', [row.telegram_id]); row.spins = fr ? fr.spins : row.spins; row.free_spin_day = today; freeSpin = true; }
   }
   const gap = now - (Number(row.last_seen_at) || lastActive);
   const gained = await accrueIncome(row, now);
@@ -986,7 +990,7 @@ app.post('/api/spin', authMiddleware, async (req, res) => {
   let roll = Math.random() * TABLE.reduce((s, x) => s + x[1], 0), seg = 'miss';
   for (const [id, w] of TABLE) { if ((roll -= w) < 0) { seg = id; break; } }
   const now = Math.floor(Date.now() / 1000);
-  const sets = ['spins = spins - 1 + ?', 'updated_at = ?'], par = [seg === 'wheel' ? 2 : 0, now];
+  const sets = ['spins = spins - 1 + ?', 'updated_at = ?', 'free_spin_left = (CASE WHEN COALESCE(free_spin_left, 0) > 0 THEN free_spin_left - 1 ELSE 0 END)'], par = [seg === 'wheel' ? 2 : 0, now];
   let amount = 0, message = 'No luck this time';
   if (seg === 'coin') {
     const P = [[500, 40], [1000, 30], [2500, 18], [5000, 9], [10000, 3]];
