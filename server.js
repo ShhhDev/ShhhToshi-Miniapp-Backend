@@ -137,6 +137,8 @@ async function ensureDb() {
     try { await dbx.exec('ALTER TABLE friends ADD COLUMN reward INTEGER DEFAULT 0'); } catch (_) {}
     try { await dbx.exec('ALTER TABLE users ADD COLUMN og_expires_at INTEGER DEFAULT 0'); } catch (_) {}
     try { await dbx.exec('ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0'); } catch (_) {}
+    try { await dbx.exec("ALTER TABLE cards ADD COLUMN accent TEXT DEFAULT ''"); } catch (_) {}
+    try { await backfillCardAccents(); } catch (e) { console.warn('accent backfill', e.message); }
     try { await dbx.exec('ALTER TABLE users ADD COLUMN last_seen_at INTEGER DEFAULT 0'); } catch (_) {}
     try { await dbx.exec("ALTER TABLE tasks ADD COLUMN chat_id TEXT DEFAULT ''"); } catch (_) {}
     try { await dbx.exec('ALTER TABLE users ADD COLUMN free_spin_day INTEGER DEFAULT 0'); } catch (_) {}
@@ -298,7 +300,7 @@ async function loadGameConfigRaw() {
     })),
     cards: cards.map(c => ({
       id: c.id, category: c.category, name: c.name, perHour: c.per_hour,
-      cost: c.cost, locked: !!c.locked, lockText: c.lock_text || '', img: c.img || ''
+      cost: c.cost, locked: !!c.locked, lockText: c.lock_text || '', img: c.img || '', accent: c.accent || ''
     })),
     boosters: boosters.map(b => ({
       id: b.id, name: b.name, desc: b.desc, metric: b.metric, icon: b.icon,
@@ -544,6 +546,7 @@ function levelTapTotal(balance) { const i = Math.max(0, LEVEL_TABLE.indexOf(leve
 function tapExtraOf(row) { return Math.max(0, (Number(row.per_tap) || 1) - 1) + (Number(row.tap_extra) || 0); }
 function effPerTap(row, now) { return levelTapTotal(row.balance) + tapExtraOf(row) + (ogActive(row, now) ? 2 : 0); }
 // Income cards: owned level L (0..8). Upgrade cost = base x 2^L; the upgrade L->L+1 adds base_ph x 1.5^L per hour
+const CARD_ACCENTS = ['#2457D6', '#7544C8', '#138F8B', '#218653', '#C44779', '#B98419', '#4249A8', '#B83D49', '#1689A8', '#35445F'];
 const CARD_MAX = Infinity; // no level cap on cards
 function cardIncome(c, n) { let t = 0; for (let k = 0; k < n; k++) t += Math.round((Number(c.per_hour) || 0) * Math.pow(1.5, k)); return t; } // each upgrade adds base x 1.5^level
 function cardView(c, L) {
@@ -1090,6 +1093,35 @@ app.delete('/api/admin/tasks/:id', authMiddleware, adminMiddleware, async (req, 
 });
 
 // ---- Cards ----
+// Random accent that never equals the neighbouring cards' accents (previous + next in the same category order).
+async function pickCardAccent(category, sortOrder, selfId) {
+  const rows = await dbx.all('SELECT id, accent, sort_order FROM cards WHERE category = ? ORDER BY sort_order, id', [category]);
+  const ids = rows.map(r => r.id);
+  const idx = ids.indexOf(selfId);
+  const avoid = new Set();
+  if (idx > 0) avoid.add(rows[idx - 1].accent);
+  if (idx >= 0 && idx < rows.length - 1) avoid.add(rows[idx + 1].accent);
+  if (idx < 0 && rows.length) avoid.add(rows[rows.length - 1].accent);
+  const pool = CARD_ACCENTS.filter(c => !avoid.has(c));
+  return pool[Math.floor(Math.random() * pool.length)] || CARD_ACCENTS[0];
+}
+async function backfillCardAccents() {
+  const rows = await dbx.all('SELECT id, category, accent FROM cards ORDER BY category, sort_order, id', []);
+  let prev = null, prevCat = null;
+  for (const r of rows) {
+    if (r.category !== prevCat) { prev = null; prevCat = r.category; }
+    let a = r.accent;
+    if (!a || !CARD_ACCENTS.includes(a) || a === prev) {
+      if (!a || !CARD_ACCENTS.includes(a)) {
+        const pool = CARD_ACCENTS.filter(c => c !== prev);
+        a = pool[Math.floor(Math.random() * pool.length)];
+        await dbx.run('UPDATE cards SET accent = ? WHERE id = ?', [a, r.id]);
+      }
+    }
+    prev = a;
+  }
+}
+
 app.get('/api/admin/cards', authMiddleware, adminMiddleware, async (req, res) => {
   res.json({ cards: await dbx.all('SELECT * FROM cards ORDER BY category, sort_order, id', []) });
 });
@@ -1098,10 +1130,12 @@ app.post('/api/admin/cards', authMiddleware, adminMiddleware, async (req, res) =
   const { id, category, name, perHour, cost, locked, lockText, img, sort_order, active } = req.body;
   const cardId = id || ('c' + Date.now());
   if (!name || !category) return res.status(400).json({ error: 'name and category required' });
+  const existingCard = await dbx.get('SELECT accent FROM cards WHERE id = ?', [cardId]);
+  const accent = (existingCard && existingCard.accent) || await pickCardAccent(category || 'finance', Number(sort_order) || 0, cardId);
 
   await dbx.run(`
-    INSERT INTO cards (id, category, name, per_hour, cost, locked, lock_text, img, sort_order, active)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO cards (id, category, name, per_hour, cost, locked, lock_text, img, sort_order, active, accent)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       category=excluded.category, name=excluded.name, per_hour=excluded.per_hour,
       cost=excluded.cost, locked=excluded.locked, lock_text=excluded.lock_text,
@@ -1115,7 +1149,8 @@ app.post('/api/admin/cards', authMiddleware, adminMiddleware, async (req, res) =
     lockText || '',
     img || '',
     Number(sort_order) || 0,
-    active === undefined || active === true || active === 1 ? 1 : 0]);
+    active === undefined || active === true || active === 1 ? 1 : 0,
+    accent]);
   res.json({ ok: true, id: cardId, cards: await dbx.all('SELECT * FROM cards ORDER BY category, sort_order, id', []) });
 });
 

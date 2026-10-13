@@ -24,6 +24,12 @@ CREATE TABLE IF NOT EXISTS users (
   char_emoji TEXT DEFAULT '',
   last_claim_daily BIGINT DEFAULT 0,
   last_reminder_at BIGINT DEFAULT 0,
+  og_expires_at BIGINT DEFAULT 0,
+  banned INTEGER DEFAULT 0,
+  last_seen_at BIGINT DEFAULT 0,
+  free_spin_day BIGINT DEFAULT 0,
+  free_spin_left INTEGER DEFAULT 0,
+  last_income_at BIGINT DEFAULT 0,
   last_active BIGINT DEFAULT 0,
   wallet TEXT DEFAULT '',
   og_pass INT DEFAULT 0,
@@ -61,6 +67,7 @@ CREATE TABLE IF NOT EXISTS friends (
   inviter_id BIGINT,
   friend_id BIGINT,
   premium INT DEFAULT 0,
+  reward BIGINT DEFAULT 0,
   joined_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
   PRIMARY KEY (inviter_id, friend_id)
 );
@@ -90,6 +97,7 @@ CREATE TABLE IF NOT EXISTS cards (
   cost INT DEFAULT 0,
   locked INT DEFAULT 0,
   lock_text TEXT DEFAULT '',
+  accent TEXT DEFAULT '',
   img TEXT DEFAULT '',
   sort_order INT DEFAULT 0,
   active INT DEFAULT 1
@@ -148,3 +156,6 @@ CREATE TABLE IF NOT EXISTS withdrawals (
 CREATE INDEX IF NOT EXISTS idx_withdrawals_user ON withdrawals(telegram_id);
 CREATE INDEX IF NOT EXISTS idx_withdrawals_status ON withdrawals(status);
 CREATE INDEX IF NOT EXISTS idx_users_balance ON users(balance DESC);
+
+-- Adsgram verified-view credits (one credit per fully watched ad)
+CREATE TABLE IF NOT EXISTS ad_credits (telegram_id BIGINT PRIMARY KEY, credits INTEGER DEFAULT 0, last_at BIGINT DEFAULT 0);
