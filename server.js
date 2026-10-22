@@ -223,6 +223,7 @@ async function seedIfEmpty() {
     withdrawal_fee_pct: '5',
     og_pass_stars_price: '100',
     og_pass_gram_price: '5',
+    support_username: '',
     spin_price: '1',
     referral_reward: '5000',
     referral_reward_premium: '25000',
@@ -319,6 +320,7 @@ async function loadGameConfigRaw() {
     withdrawalFeePct: Number(await getSetting('withdrawal_fee_pct', '5')) || 5,
     ogPassStarsPrice: Number(await getSetting('og_pass_stars_price', '100')) || 100,
     ogPassGramPrice: Number(await getSetting('og_pass_gram_price', '5')) || 5,
+    supportUsername: String(await getSetting('support_username', '') || '').replace(/^.*t\.me\//i, '').replace(/^@/, '').trim(),
     spinPrice: Number(await getSetting('spin_price', '1')) || 1,
     spinPacks: await getSpinPackages(),
     inviteMessage: String(await getSetting('invite_message', DEFAULT_INVITE_MSG)).replace(/<[^>]+>/g, ''),
@@ -402,7 +404,7 @@ function authMiddleware(req, res, next) {
     return res.status(401).json({ error: 'Invalid or expired Telegram auth. Open the Mini App inside Telegram.' });
   }
   req.tg = validated;
-  isBanned(validated.user.id).then(v => { if (v) return res.status(403).json({ error: 'Account suspended' }); next(); }).catch(() => next());
+  isBanned(validated.user.id).then(async v => { if (v) { const su = String(await getSetting('support_username', '') || '').replace(/^.*t\.me\//i, '').replace(/^@/, '').trim(); return res.status(403).json({ error: 'Account suspended', banned: true, supportUsername: su }); } next(); }).catch(() => next());
 }
 
 function adminMiddleware(req, res, next) {
